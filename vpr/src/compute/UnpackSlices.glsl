@@ -20,7 +20,7 @@ layout(bind = 0, location = 1, std430) restrict readonly buffer _InputData
 	uint blob[];
 } InputData;
 
-layout(bind = 1, location = 0, rgba32i) restrict writeonly image2D CoefficientImage;
+layout(bind = 1, location = 0, rgba32i) restrict writeonly uniform image2D CoefficientImage;
 
 const uint BLOCK_SCAN_PROGRESSIVE[64] = uint[64](
 	 0,  1,  4,  5, 16, 17, 21, 22,
