@@ -7,8 +7,8 @@
 
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-layout(bind = 0, location = 0, rgba32i) restrict readonly  image2D CoefficientImage;
-layout(bind = 0, location = 1, rgba32i) restrict writeonly image2D ComponentImage;
+layout(bind = 0, location = 0, rgba32i) restrict readonly  uniform image2D CoefficientImage;
+layout(bind = 0, location = 1, rgba32i) restrict writeonly uniform image2D ComponentImage;
 
 const float C[8] = float[8](0.707106781187, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
 const float PI = 3.141592653589;
