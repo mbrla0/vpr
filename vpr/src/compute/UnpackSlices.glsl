@@ -2,33 +2,43 @@
 #pragma shader_stage(compute)
 #include "Constants.glsl"
 
+/// UnpackSlices.glsl
 ///
-///
-///
+/// aa
 
 layout(constant_id = 0) const int cLittleEndian = 1;
-layout(constant_id = 1) const int cChromaFormat = CHROMA_FORMAT_4_2_2;
+layout(constant_id = 1) const int cSubsamplingMode = SUBSAMPLING_MODE_4_2_2;
 layout(constant_id = 2) const int cAlphaFormat = ALPHA_CHANNEL_DISABLED;
+layout(constant_id = 3) const int cScanningMode = SCANNING_MODE_PROGRESSIVE;
 
 struct IndexEntry
 {
 	uint offset;
 	uint position;
-};
+	uint coded_size;
+};	
 
-layout(set = 0, binding = 0, std430) restrict readonly buffer _InputSliceIndex
+layout(set = 0, binding = 0, std430) restrict readonly buffer _FrameHeader
 {
-	IndexEntry elements[];
-} InputSliceIndex;
-layout(set = 0, binding = 1, std430) restrict readonly buffer _InputData
+	uint quantization_matrices[32];
+
+	IndexEntry slice_index[];
+} gFrameHeader;
+
+#define QUANTIZATION_LUMA 0
+#define QUANTIZATION_CHROMA 16
+
+#define QUANTIZATION(b, i, j) ((gFrameHeader.quantization_matrices[b + i + (j >> 2U)] >> ((j & 3U) * 8)) & 0xFFU)
+
+layout(set = 0, binding = 1, std430) restrict readonly buffer _Frame
 {
 	uint blob[];
-} InputData;
+} gFrame;
 
-layout(set = 1, binding = 0, rgba32i) restrict uniform iimage2D CoefficientImage;
+layout(set = 1, binding = 0, rgba32f) restrict uniform image2D CoefficientImage;
 
-#define INPUT_SLICE InputSliceIndex.elements[gl_GlobalInvocationID.x]
-#define INPUT_WORD(index) InputData.blob[InputSliceIndex.elements[gl_GlobalInvocationID.x].offset + (index)]
+#define INPUT_SLICE gFrameHeader.slice_index[gl_GlobalInvocationID.x]
+#define INPUT_WORD(index) gFrame.blob[INPUT_SLICE.offset + (index)]
 
 /// Patterns for block assembly in both progressive and interlaced modes.
 const uint BLOCK_SCAN_INV[128] = uint[128](
@@ -375,6 +385,15 @@ bool end_of_data(
 	return pass;
 }
 
+/// Derive the value of `qScale` for the given quantization index.
+uint qscale(uint index)
+{
+	if(index <= 128)
+		return index;
+	else
+		return 128 + ((index - 128) << 2U);
+}
+
 void unpack_coefficients(
 	inout BitCursor cursor,
 	uint coded_data_size,
@@ -383,6 +402,8 @@ void unpack_coefficients(
 	uint log2_block_count_per_macroblock,
 	uint macroblock_scan_pattern,
 	uint block_scan_pattern,
+	uint quantization_index,
+	uint quantization_matrix,
 	uint target_component)
 {
 	/* Keep track of how many bits we've read from the start of the structure. */
@@ -400,11 +421,17 @@ void unpack_coefficients(
 				+ (base_mb_offset + uvec2((mb), 0)).y * 16 \
 				+ (BLOCK_SCAN_INV[block_scan_pattern + (freq)] >> 3U) \
 		)
-	#define TARGET_STORE(mb, b, freq, val) \
+	#define TARGET_DEQUANTIZE_AND_STORE(mb, b, freq, val) \
 		{ \
 			ivec2 _pos = TARGET_PIXEL(mb, b, freq); \
-			ivec4 _value = imageLoad(CoefficientImage, _pos); \
-			_value[target_component] = (val); \
+			\
+			float _dequantized = float(val) \
+				* QUANTIZATION(quantization_matrix, (freq >> 3U), (freq & 7U))\
+				* float(qscale(quantization_index)) \
+				* 8.0; \
+			\
+			vec4 _value = imageLoad(CoefficientImage, _pos); \
+			_value[target_component] = _dequantized; \
 			imageStore(CoefficientImage, _pos, _value); \
  		}
 
@@ -413,7 +440,7 @@ void unpack_coefficients(
 	int last_dc_diff = 3;
 	int last_dc_coeff = first_dc_coeff;
 
-	TARGET_STORE(0, 0, 0, first_dc_coeff);
+	TARGET_DEQUANTIZE_AND_STORE(0, 0, 0, first_dc_coeff);
 	uint fj = 1;
 	for(uint i = 0; i < (1U << log2_macroblock_count); ++i)
 	{
@@ -429,7 +456,7 @@ void unpack_coefficients(
 			if(last_dc_diff < 0)
 				val = -val;
 
-			TARGET_STORE(i, j, 0, val);
+			TARGET_DEQUANTIZE_AND_STORE(i, j, 0, val);
 
 			last_dc_diff = diff;
 			last_dc_coeff = val;
@@ -446,10 +473,10 @@ void unpack_coefficients(
 	#define COEFFICIENT_BLOCK (coefficient & ((2U << log2_block_count_per_macroblock) - 1U))
 	#define COEFFICIENT_MB (coefficient >> log2_block_count_per_macroblock)
 	#define COEFFICIENT_FREQ (coefficient >> (log2_macroblock_count + log2_block_count_per_macroblock))
-	#define STORE_NEXT_COEFFICIENT(val) \
+	#define DEQUANTIZE_AND_STORE_NEXT_COEFFICIENT(val) \
 		{ \
 			if(coefficient >= TOTAL_COEFFICIENTS) break; \
-			TARGET_STORE(COEFFICIENT_MB, COEFFICIENT_BLOCK, COEFFICIENT_FREQ, val); \
+			TARGET_DEQUANTIZE_AND_STORE(COEFFICIENT_MB, COEFFICIENT_BLOCK, COEFFICIENT_FREQ, val); \
 			coefficient += 1; \
  		}
 
@@ -460,7 +487,7 @@ void unpack_coefficients(
 			CODEBOOK_ADAPTATION_AC_RUN,
 			last_ac_run);
 		for(uint i = 0; i < run; ++i)
-			STORE_NEXT_COEFFICIENT(0);
+			DEQUANTIZE_AND_STORE_NEXT_COEFFICIENT(0);
 
 		int abs_level_minus_1 = cursor_next_adapted_code(
 			cursor,
@@ -470,13 +497,13 @@ void unpack_coefficients(
 		bool negative = cursor_next_bit(cursor);
 
 		int level = (abs_level_minus_1 + 1) * (1 - 2 * (negative ? 1 : 0));
-		STORE_NEXT_COEFFICIENT(level);
+		DEQUANTIZE_AND_STORE_NEXT_COEFFICIENT(level);
 	}
 
 	/* The last run is implicit, fill all of the coefficients we haven't yet
 	 * with zeroes. */
 	while(coefficient < TOTAL_COEFFICIENTS)
-		STORE_NEXT_COEFFICIENT(0);
+		DEQUANTIZE_AND_STORE_NEXT_COEFFICIENT(0);
 
 	uint covered = cursor_distance(cursor, cp_beg);
 	if(covered <= (coded_data_size << 3U))
@@ -488,7 +515,7 @@ void main()
 	BitCursor cursor;
 	cursor_seek(cursor, 0, 0);
 
-	/* Parse the slice header. */
+	/* Parse the slice's header and derive all of the quantities related to it. */
 	uint slice_header_size = cursor_next_bits(cursor, 8) >> 3;
 	uint quantization_index = cursor_next_bits(cursor, 8);
 	uint coded_size_of_y_data = cursor_next_bits(cursor, 16);
@@ -497,9 +524,16 @@ void main()
 	if(cAlphaFormat != ALPHA_CHANNEL_DISABLED)
 		coded_size_of_cr_data = cursor_next_bits(cursor, 16);
 	else
-	{
-		
-	}
+		coded_size_of_cr_data = 
+			  INPUT_SLICE.coded_size
+			- slice_header_size
+			- coded_size_of_y_data
+			- coded_size_of_cb_data;  
+	
+	uvec2 slice_mb_offset = uvec2(
+		(INPUT_SLICE.position & 0x00007fffU) >> 0,
+		(INPUT_SLICE.position & 0x3fff8000U) >> 15);
+	uint log2_slice_len_mb = (INPUT_SLICE.position & 0xc0000000U) >> 30;
 
 	/* Seek the cursor to the start of the coded color data. */
 	cursor_seek(
@@ -507,11 +541,28 @@ void main()
 		slice_header_size >> 2U, 
 		(slice_header_size & 3U) << 3U);
 
-	uvec2 slice_mb_offset = uvec2(
-		(INPUT_SLICE.position & 0x00007fffU) >> 0,
-		(INPUT_SLICE.position & 0x3fff8000U) >> 15);
-	uint log2_slice_len_mb = (INPUT_SLICE.position & 0xc0000000U) >> 30;
+	/* Set the picture scanning modes. */
+	uint chroma_mb_scan;
+	uint block_scan;
+	uint chroma_log2_block_count_per_macroblock;
 
+	if(cSubsamplingMode == SUBSAMPLING_MODE_4_2_2)
+	{
+		chroma_mb_scan = MACROBLOCK_SCAN_INV_HALF_HORZ;
+		chroma_log2_block_count_per_macroblock = 1;
+	}
+	else
+	{
+		chroma_mb_scan = MACROBLOCK_SCAN_INV_FULL;
+		chroma_log2_block_count_per_macroblock = 2;
+	}
+	
+	if(cScanningMode == SCANNING_MODE_INTERLACED)
+		block_scan = BLOCK_SCAN_INV_INTERLACED;
+	else
+		block_scan = BLOCK_SCAN_INV_PROGRESSIVE;
+
+	/* Unpack the coefficients for the luma and chroma information. */
 	unpack_coefficients(
 		cursor,
 		coded_size_of_y_data,
@@ -519,6 +570,32 @@ void main()
 		log2_slice_len_mb,
 		2,
 		MACROBLOCK_SCAN_INV_FULL,
-		BLOCK_SCAN_INV_PROGRESSIVE,
+		block_scan,
+		quantization_index,
+		QUANTIZATION_LUMA,
 		0);
+
+	unpack_coefficients(
+		cursor,
+		coded_size_of_cb_data,
+		slice_mb_offset,
+		log2_slice_len_mb,
+		chroma_log2_block_count_per_macroblock,
+		chroma_mb_scan,
+		block_scan,
+		quantization_index,
+		QUANTIZATION_CHROMA,
+		1);
+
+	unpack_coefficients(
+		cursor,
+		coded_size_of_cr_data,
+		slice_mb_offset,
+		log2_slice_len_mb,
+		chroma_log2_block_count_per_macroblock,
+		chroma_mb_scan,
+		block_scan,
+		quantization_index,
+		QUANTIZATION_CHROMA,
+		2);
 }
