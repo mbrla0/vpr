@@ -5,3 +5,6 @@
 #![feature(const_ptr_read)]
 
 mod syntax;
+
+struct Instance {
+}

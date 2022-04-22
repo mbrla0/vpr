@@ -1,13 +1,14 @@
 #version 460
 #pragma shader_stage(compute)
+#include "Constants.glsl"
 
 ///
 ///
 ///
 
 layout(constant_id = 0) const int cLittleEndian = 1;
-layout(constant_id = 1) const int cChromaFormat = 2;
-layout(constant_id = 2) const int cAlphaFormat = 0;
+layout(constant_id = 1) const int cChromaFormat = CHROMA_FORMAT_4_2_2;
+layout(constant_id = 2) const int cAlphaFormat = ALPHA_CHANNEL_DISABLED;
 
 struct IndexEntry
 {
@@ -116,15 +117,17 @@ const uint CODEBOOK_ADAPTATION_TABLE[29] = uint[29](
 ///
 int golomb_symbol_to_int(uint symbol)
 {
-	int sign = int(symbol % 2U);
+	int sign = int(symbol & 1U);
 	int abs = int(symbol >> 1U);
 
-	abs += sign;
-	abs *= sign * -1;
+	abs += 1;
+	abs >>= 1;
 
+	abs *= -sign * 2 + 1;
 	return abs;
 }
 
+/// This structure keeps track of a bit-precise pointer into the input data.
 struct BitCursor
 {
 	uint cached_word;
@@ -224,6 +227,20 @@ bool cursor_next_bit(inout BitCursor cursor)
 	cursor.bit_offset += 1;
 
 	return set;
+}
+
+/// Pulls in the next number of bits from the cursor.
+uint cursor_next_bits(inout BitCursor cursor, uint count)
+{
+	uint acc = 0;
+	while(count > 0)
+	{
+		acc <<= 1;
+		acc  |= cursor_next_bit(cursor) == true ? 1U : 0U;
+
+		count -= 1;
+	}
+	return acc;
 }
 
 /// Parses the next Exponential Golomb code word with the given parameters,
@@ -468,23 +485,33 @@ void unpack_coefficients(
 
 void main()
 {
+	BitCursor cursor;
+	cursor_seek(cursor, 0, 0);
+
+	/* Parse the slice header. */
+	uint slice_header_size = cursor_next_bits(cursor, 8) >> 3;
+	uint quantization_index = cursor_next_bits(cursor, 8);
+	uint coded_size_of_y_data = cursor_next_bits(cursor, 16);
+	uint coded_size_of_cb_data = cursor_next_bits(cursor, 16);
+	uint coded_size_of_cr_data;
+	if(cAlphaFormat != ALPHA_CHANNEL_DISABLED)
+		coded_size_of_cr_data = cursor_next_bits(cursor, 16);
+	else
+	{
+		
+	}
+
+	/* Seek the cursor to the start of the coded color data. */
+	cursor_seek(
+		cursor, 
+		slice_header_size >> 2U, 
+		(slice_header_size & 3U) << 3U);
+
 	uvec2 slice_mb_offset = uvec2(
 		(INPUT_SLICE.position & 0x00007fffU) >> 0,
 		(INPUT_SLICE.position & 0x3fff8000U) >> 15);
 	uint log2_slice_len_mb = (INPUT_SLICE.position & 0xc0000000U) >> 30;
 
-	uint coded_size_of_y_data;
-	if(cLittleEndian != 0)
-	{
-		coded_size_of_y_data = (INPUT_WORD(0) >> 32U) & 0xFFFFU;
-	}
-	else
-	{
-		coded_size_of_y_data = (INPUT_WORD(0) >> 16U) & 0xFFFFU;
-	}
-
-	BitCursor cursor;
-	cursor_seek(cursor, 2, 0);
 	unpack_coefficients(
 		cursor,
 		coded_size_of_y_data,
