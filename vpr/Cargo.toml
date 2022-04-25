@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 ash = "0.37"
+thiserror = "1"
+c_str_macro = "1"
+
+[features]

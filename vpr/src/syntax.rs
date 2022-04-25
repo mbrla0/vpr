@@ -79,7 +79,7 @@ impl<T> BitString<T> {
 struct QuantizationMatrix([u8; 64]);
 impl QuantizationMatrix {
 	#[inline(always)]
-	pub const unsafe fn get_unchecked(&self, i: usize, j: usize) -> u8 {
+	pub unsafe fn get_unchecked(&self, i: usize, j: usize) -> u8 {
 		*self.0.get_unchecked(i * 8 + j)
 	}
 
