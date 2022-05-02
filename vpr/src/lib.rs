@@ -2,13 +2,13 @@
 //!
 //! This crate provides an interface to
 #![feature(const_ptr_read)]
-#![feature(const_ptr_offset)]
 
 mod syntax;
 
 mod error;
 mod prores;
 mod decode;
+mod endian;
 
 pub use prores::*;
 pub use decode::*;
@@ -87,11 +87,13 @@ impl Instance {
 				.map_err(Error::from_vk_general)?
 		};
 
-		Ok(Self(Box::new(VulkanContext {
-			entry,
-			instance,
-			physical_device,
-			device
+		Ok(Self(Arc::new(Context {
+			vulkan: VulkanContext {
+				entry,
+				instance,
+				physical_device,
+				device
+			}
 		})))
 	}
 
@@ -104,12 +106,20 @@ impl Instance {
 
 /// The shared context any given instance is reliant on.
 struct Context {
+	vulkan: VulkanContext
+}
+
+/// The shared context any given instance is reliant on.
+pub struct VulkanContext {
 	entry: ash::Entry,
 	instance: ash::Instance,
 	physical_device: ash::vk::PhysicalDevice,
 	device: ash::Device,
-
-
+}
+impl VulkanContext {
+	pub fn instance(&self) -> &ash::Instance { &self.instance }
+	pub fn physical_device(&self) -> &vk::PhysicalDevice { &self.physical_device }
+	pub fn device(&self) -> &ash::Device { &self.device }
 }
 
 /// The requirements for a given physical device to be suitable.

@@ -1,0 +1,14 @@
+[package]
+name = "sshdr"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+shaderc = "0.7"
+
+syn = "1"
+quote = "1"
+proc-macro2 = "1"
