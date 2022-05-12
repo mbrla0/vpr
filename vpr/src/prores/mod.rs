@@ -2,6 +2,9 @@ use crate::decode::Decoder;
 use crate::VulkanContext;
 use ash::vk;
 
+mod syntax;
+mod endian;
+
 pub struct ProRes;
 impl Decoder for ProRes {
 	type SharedState = SharedState;

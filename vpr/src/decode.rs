@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use ash::vk;
 use crate::{VulkanContext, Error, Context};
 
 pub trait Decoder {
@@ -27,12 +28,16 @@ pub trait Decoder {
 pub struct DecodeQueue<C> {
 	context: Arc<Context>,
 	decoder: C,
+
+	frame_carriage: Vec<vk::Image>,
+	gay_baby_jail: Vec<vk::Image>,
+	
 }
 impl<C> DecodeQueue<C> {
 	pub(crate) fn new(
 		context: Arc<Context>,
 		decoder: C) -> Result<Self, Error> {
 
-		todo!()
+
 	}
 }
