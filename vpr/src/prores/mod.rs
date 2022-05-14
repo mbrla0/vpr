@@ -174,9 +174,9 @@ pub struct InstanceState {
 }
 
 mod shaders {
-	#[sshdr::include(file = "UnpackSlices.glsl", stage = "compute")]
+	#[sshdr::include(file = "../../../shaders/prores/UnpackSlices.glsl", stage = "compute")]
 	pub static UNPACK_SLICES: &'static [u32];
 
-	#[sshdr::include(file = "IDCT.glsl", stage = "compute")]
+	#[sshdr::include(file = "../../../shaders/prores/IDCT.glsl", stage = "compute")]
 	pub static IDCT: &'static [u32];
 }
