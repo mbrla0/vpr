@@ -2,6 +2,9 @@ use crate::decode::Decoder;
 use crate::VulkanContext;
 use ash::vk;
 
+mod syntax;
+mod endian;
+
 pub struct ProRes;
 impl Decoder for ProRes {
 	type Error = ();
@@ -173,9 +176,9 @@ pub struct InstanceState {
 }
 
 mod shaders {
-	#[sshdr::include(file = "UnpackSlices.glsl", stage = "compute")]
+	#[sshdr::include(file = "../../../shaders/prores/UnpackSlices.glsl", stage = "compute")]
 	pub static UNPACK_SLICES: &'static [u32];
 
-	#[sshdr::include(file = "IDCT.glsl", stage = "compute")]
+	#[sshdr::include(file = "../../../shaders/prores/IDCT.glsl", stage = "compute")]
 	pub static IDCT: &'static [u32];
 }

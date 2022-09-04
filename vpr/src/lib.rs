@@ -3,12 +3,9 @@
 //! This crate provides an interface to
 #![feature(const_ptr_read)]
 
-mod syntax;
-
 mod error;
 mod prores;
 mod decode;
-mod endian;
 
 pub use prores::*;
 pub use decode::*;

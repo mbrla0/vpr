@@ -2,8 +2,6 @@ use std::sync::Arc;
 use crate::{Context, Error};
 
 pub trait Decoder {
-	/// Error type for this decoder.
-	type Error;
 	/// State data shared between all grouped instances of a decoder type.
 	type SharedState;
 	/// State data local to one decoder instance of a decoder type.
@@ -35,6 +33,6 @@ impl<C> DecodeQueue<C> {
 		context: Arc<Context>,
 		decoder: C) -> Result<Self, Error> {
 
-
+		todo!()
 	}
 }
