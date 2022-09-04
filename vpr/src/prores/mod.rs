@@ -4,8 +4,17 @@ use ash::vk;
 
 pub struct ProRes;
 impl Decoder for ProRes {
+	type Error = ();
 	type SharedState = SharedState;
 	type InstanceState = InstanceState;
+
+	fn begin(&self, context: &VulkanContext, shared: &Self::SharedState, instance: &mut Self::InstanceState) {
+		todo!()
+	}
+
+	fn end(&self, context: &VulkanContext, shared: &Self::SharedState, instance: &mut Self::InstanceState) {
+		todo!()
+	}
 
 	fn create_shared_state(context: &VulkanContext) -> Result<Self::SharedState, ()> {
 		let vk = &context.device;
@@ -106,6 +115,13 @@ impl Decoder for ProRes {
 		}
 	}
 
+	fn create_instance_state(context: &VulkanContext) -> Result<Self::InstanceState, ()> {
+		let vk = &context.device;
+		unsafe {
+
+		}
+	}
+
 	fn destroy_shared_state(context: &VulkanContext, shared: &mut Self::SharedState) {
 		let vk = &context.device;
 		unsafe {
@@ -116,25 +132,11 @@ impl Decoder for ProRes {
 		}
 	}
 
-	fn create_instance_state(context: &VulkanContext) -> Result<Self::InstanceState, ()> {
-		let vk = &context.device;
-		unsafe {
-
-		}
-	}
-
 	fn destroy_instance_state(context: &VulkanContext, instance: &mut Self::InstanceState) {
 		let vk = &context.device;
 		unsafe {
 			vk.free_command_buffers()
 		}
-	}
-
-	fn begin(&self, context: &VulkanContext, shared: &Self::SharedState, instance: &mut Self::InstanceState) {
-		todo!()
-	}
-	fn end(&self, context: &VulkanContext, shared: &Self::SharedState, instance: &mut Self::InstanceState) {
-		todo!()
 	}
 }
 

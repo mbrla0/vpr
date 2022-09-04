@@ -113,7 +113,7 @@ struct Context {
 pub struct VulkanContext {
 	entry: ash::Entry,
 	instance: ash::Instance,
-	physical_device: ash::vk::PhysicalDevice,
+	physical_device: vk::PhysicalDevice,
 	device: ash::Device,
 }
 impl VulkanContext {

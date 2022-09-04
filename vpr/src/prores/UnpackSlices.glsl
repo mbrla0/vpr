@@ -521,7 +521,7 @@ void main()
 	uint coded_size_of_y_data = cursor_next_bits(cursor, 16);
 	uint coded_size_of_cb_data = cursor_next_bits(cursor, 16);
 	uint coded_size_of_cr_data;
-	if(cAlphaFormat != ALPHA_CHANNEL_DISABLED)
+	if(cAlphaFormat == ALPHA_CHANNEL_DISABLED)
 		coded_size_of_cr_data = cursor_next_bits(cursor, 16);
 	else
 		coded_size_of_cr_data = 

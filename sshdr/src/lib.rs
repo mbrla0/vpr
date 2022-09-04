@@ -15,9 +15,9 @@ pub fn include(attribute: TokenStream, item: TokenStream) -> TokenStream {
 	let ItemDeclaration { vis, memory, ident, .. } = item;
 
 	let data = compiler::execute(&request).into_iter();
-	quote::quote! {
+	(quote::quote! {
 		#vis #memory #ident: &'static [u32] = &[
 			#(#data),*
 		];
-	}.into()
+	}).into()
 }
