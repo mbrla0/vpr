@@ -6,7 +6,7 @@
 mod error;
 mod prores;
 mod decode;
-
+mod image;
 pub use prores::*;
 pub use decode::*;
 pub use error::*;

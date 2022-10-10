@@ -1,21 +1,22 @@
 use crate::decode::Decoder;
-use crate::VulkanContext;
+use crate::{Context, DecodeScheduler, VulkanContext};
 use ash::vk;
-
+use crate::image::{Frame, Image};
 mod syntax;
 mod endian;
 
 pub struct ProRes;
 impl Decoder for ProRes {
-	type Error = ();
 	type SharedState = SharedState;
 	type InstanceState = InstanceState;
+	type FrameState = ();
+	type Error = ();
 
-	fn begin(&self, context: &VulkanContext, shared: &Self::SharedState, instance: &mut Self::InstanceState) {
+	fn schedule(&self, context: &Context, shared: &Self::SharedState, instance: &mut Self::InstanceState, frames: &DecodeScheduler<Self>, data: &[u8]) {
 		todo!()
 	}
 
-	fn end(&self, context: &VulkanContext, shared: &Self::SharedState, instance: &mut Self::InstanceState) {
+	fn decode(&self, context: &Context, shared: &Self::SharedState, instance: &Self::InstanceState, frame: &Frame<Self::FrameState>, data: &[u8]) {
 		todo!()
 	}
 
@@ -125,6 +126,9 @@ impl Decoder for ProRes {
 		}
 	}
 
+	fn create_frame_state(context: &Context, shared: &Self::SharedState, instance: &Self::InstanceState, image: &Image) -> Result<Self::FrameState, Self::Error> {
+		todo!()
+	}
 	fn destroy_shared_state(context: &VulkanContext, shared: &mut Self::SharedState) {
 		let vk = &context.device;
 		unsafe {
@@ -134,12 +138,14 @@ impl Decoder for ProRes {
 			vk.destroy_descriptor_set_layout(shared.frame_set_layout, None);
 		}
 	}
-
 	fn destroy_instance_state(context: &VulkanContext, instance: &mut Self::InstanceState) {
 		let vk = &context.device;
 		unsafe {
 			vk.free_command_buffers()
 		}
+	}
+	fn destroy_frame_state(context: &Context, shared: &Self::SharedState, instance: &Self::InstanceState, frame: &mut Self::FrameState) {
+		todo!()
 	}
 }
 
@@ -155,24 +161,11 @@ pub struct SharedState {
 }
 
 pub struct InstanceState {
-	unpack_pipelines: [vk::Pipeline; 8],
-	idct_pipeline: vk::Pipeline,
 
-	mem_shared: vk::DeviceMemory,
-	mem_local: vk::DeviceMemory,
+}
 
-	frame_header: vk::BufferView,
-	frame_data: vk::BufferView,
-
-	processing_image_buffer: [vk::Image],
-
-
-	set_pool: vk::DescriptorPool,
-	image_set: vk::DescriptorSet,
-	frame_set: vk::DescriptorSet,
-
-	cmd_pool: vk::CommandPool,
-	cmd_set: vk::CommandBuffer
+pub struct FrameState {
+	command_buffer:
 }
 
 mod shaders {

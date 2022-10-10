@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ash = "0.37"
+ash = "0"
 thiserror = "1"
 c_str_macro = "1"
 sshdr = { path = "../sshdr" }
