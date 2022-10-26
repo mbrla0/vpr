@@ -5,10 +5,14 @@
 
 mod error;
 mod prores;
-mod decode;
+mod decoder;
 mod image;
+mod context;
+
+pub use context::*;
+
 pub use prores::*;
-pub use decode::*;
+pub use decoder::*;
 pub use error::*;
 
 use std::cell::RefCell;
@@ -17,7 +21,7 @@ use ash::vk;
 use c_str_macro::c_str;
 
 ///
-pub struct Instance(Arc<Context>);
+pub struct Instance(Arc<VprContext>);
 impl Instance {
 	pub fn new<F>(mut devices: F) -> Result<Self, Error>
 		where F: FnMut(&[SuitablePhysicalDevice]) {
@@ -84,12 +88,15 @@ impl Instance {
 				.map_err(Error::from_vk_general)?
 		};
 
-		Ok(Self(Arc::new(Context {
-			vulkan: VulkanContext {
-				entry,
-				instance,
-				physical_device,
-				device
+		Ok(Self(Arc::new(VprContext {
+			entry,
+			instance,
+			device: VprDeviceContext {
+				shared_decoder_state: Default::default(),
+				graphics_context: Arc::new(DeviceContext {
+					physical_device,
+					device
+				})
 			}
 		})))
 	}
@@ -99,24 +106,6 @@ impl Instance {
 
 		todo!()
 	}
-}
-
-/// The shared context any given instance is reliant on.
-struct Context {
-	vulkan: VulkanContext
-}
-
-/// The shared context any given instance is reliant on.
-pub struct VulkanContext {
-	entry: ash::Entry,
-	instance: ash::Instance,
-	physical_device: vk::PhysicalDevice,
-	device: ash::Device,
-}
-impl VulkanContext {
-	pub fn instance(&self) -> &ash::Instance { &self.instance }
-	pub fn physical_device(&self) -> &vk::PhysicalDevice { &self.physical_device }
-	pub fn device(&self) -> &ash::Device { &self.device }
 }
 
 /// The requirements for a given physical device to be suitable.

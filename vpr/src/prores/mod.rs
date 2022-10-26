@@ -1,5 +1,5 @@
-use crate::decode::Decoder;
-use crate::{Context, DecodeScheduler, VulkanContext};
+use crate::decoder::Decoder;
+use crate::{Context, DecodeScheduler, DeviceContext};
 use ash::vk;
 use crate::image::{Frame, Image};
 mod syntax;
@@ -20,7 +20,7 @@ impl Decoder for ProRes {
 		todo!()
 	}
 
-	fn create_shared_state(context: &VulkanContext) -> Result<Self::SharedState, ()> {
+	fn create_shared_state(context: &DeviceContext) -> Result<Self::SharedState, ()> {
 		let vk = &context.device;
 		unsafe {
 			let unpack_slices = vk.create_shader_module(
@@ -119,7 +119,7 @@ impl Decoder for ProRes {
 		}
 	}
 
-	fn create_instance_state(context: &VulkanContext) -> Result<Self::InstanceState, ()> {
+	fn create_instance_state(context: &DeviceContext) -> Result<Self::InstanceState, ()> {
 		let vk = &context.device;
 		unsafe {
 
@@ -129,7 +129,7 @@ impl Decoder for ProRes {
 	fn create_frame_state(context: &Context, shared: &Self::SharedState, instance: &Self::InstanceState, image: &Image) -> Result<Self::FrameState, Self::Error> {
 		todo!()
 	}
-	fn destroy_shared_state(context: &VulkanContext, shared: &mut Self::SharedState) {
+	fn destroy_shared_state(context: &DeviceContext, shared: &mut Self::SharedState) {
 		let vk = &context.device;
 		unsafe {
 			vk.destroy_shader_module(shared.unpack_slices, None);
@@ -138,7 +138,7 @@ impl Decoder for ProRes {
 			vk.destroy_descriptor_set_layout(shared.frame_set_layout, None);
 		}
 	}
-	fn destroy_instance_state(context: &VulkanContext, instance: &mut Self::InstanceState) {
+	fn destroy_instance_state(context: &DeviceContext, instance: &mut Self::InstanceState) {
 		let vk = &context.device;
 		unsafe {
 			vk.free_command_buffers()
