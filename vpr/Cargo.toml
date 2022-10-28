@@ -8,5 +8,6 @@ ash = "0"
 thiserror = "1"
 c_str_macro = "1"
 sshdr = { path = "../sshdr" }
+arrayvec = "0"
 
 [features]

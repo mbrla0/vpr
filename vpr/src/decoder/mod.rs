@@ -2,6 +2,7 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::{Context, DeviceContext, Error};
+use crate::context::VprContext;
 use crate::image::{Frame, Image};
 
 /// Decoder.
@@ -21,6 +22,8 @@ use crate::image::{Frame, Image};
 /// 		  cores in the system.
 /// - Instance: Resources local to a specific decoder on a given device and
 ///             shared between frame production procedure calls.
+/// - Worker: Resources shared between frames, but local to a single specific
+/// 		  core in the system.
 /// - Frame: Resources local to video frame production and pegged to specific
 ///          cores in the system.
 ///
@@ -29,7 +32,9 @@ pub trait Decoder {
 	type SharedState;
 	/// State data local to one decoder instance of a decoder type.
 	type InstanceState;
-	/// State date associated with each frame of the decoder.
+	/// State data associated with each worker of the decoder.
+	type WorkerState: ?Send + ?Sync;
+	/// State data associated with each frame of the decoder.
 	type FrameState: ?Send + ?Sync;
 	/// Parameters passed by the scheduler function to the decoder function.
 	type FrameParam;
@@ -49,6 +54,7 @@ pub trait Decoder {
 		context: &DeviceContext,
 		shared: &Self::SharedState,
 		instance: &Self::InstanceState,
+		worker: &mut Self::WorkerState,
 		frame: &mut Frame<Self::FrameState>,
 		param: Self::FrameParam,
 		data: &[u8]);
@@ -58,10 +64,15 @@ pub trait Decoder {
 	fn create_instance_state(
 		context: &DeviceContext,
 		shared: &Self::SharedState) -> Result<Self::InstanceState, Self::Error>;
+	fn create_worker_state(
+		context: &DeviceContext,
+		shared: &Self::SharedState,
+		instance: &Self::InstanceState) -> Result<Self::WorkerState, Self::Error>;
 	fn create_frame_state(
 		context: &DeviceContext,
 		shared: &Self::SharedState,
 		instance: &Self::InstanceState,
+		worker: &mut Self::WorkerState,
 		image: &Image) -> Result<Self::FrameState, Self::Error>;
 
 	fn destroy_shared_state(
@@ -71,10 +82,16 @@ pub trait Decoder {
 		context: &DeviceContext,
 		shared: &Self::SharedState,
 		instance: &mut Self::InstanceState);
+	fn destroy_worker_state(
+		context: &DeviceContext,
+		shared: &Self::SharedState,
+		instance: &Self::InstanceState,
+		worker: &mut Self::WorkerState);
 	fn destroy_frame_state(
 		context: &DeviceContext,
 		shared: &Self::SharedState,
 		instance: &Self::InstanceState,
+		worker: &mut Self::WorkerState,
 		frame: &mut Self::FrameState);
 }
 
@@ -83,13 +100,13 @@ pub trait Decoder {
 /// This is the main structure through which decoding is actually performed and
 /// decoding operations are set up.
 pub struct DecodeQueue<C> {
-	context: Arc<Context>,
+	context: Arc<VprContext>,
 	decoder: C,
 	incoming_data_buffer: Vec<u8>,
 }
 impl<C> DecodeQueue<C> {
 	pub(crate) fn new(
-		context: Arc<Context>,
+		context: Arc<VprContext>,
 		decoder: C) -> Result<Self, Error> {
 
 		Ok(Self {
