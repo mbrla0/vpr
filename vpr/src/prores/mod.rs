@@ -1,21 +1,27 @@
-use std::collections::VecDeque;
+use std::collections::linked_list::LinkedList;
+use std::collections::vec_deque::VecDeque;
 use arrayvec::ArrayVec;
 use ash::prelude::VkResult;
 use crate::decoder::Decoder;
-use crate::{Context, DecodeScheduler, DeviceContext};
+use crate::{VprContext, DecodeScheduler, DeviceContext};
+
 use ash::vk;
-use crate::image::{Frame, Image};
+use crate::image::{Frame, ImageView};
+
 mod syntax;
 mod endian;
+mod macros;
 
 pub struct ProRes;
+impl ProRes {
+}
 impl Decoder for ProRes {
 	type SharedState = SharedState;
 	type InstanceState = InstanceState;
 	type WorkerState = WorkerState;
 	type FrameState = FrameState;
 	type FrameParam = ();
-	type Error = ();
+	type Error = Error;
 
 	fn schedule(&self,
 		context: &DeviceContext,
@@ -39,7 +45,7 @@ impl Decoder for ProRes {
 		todo!()
 	}
 
-	fn create_shared_state(context: &DeviceContext) -> Result<Self::SharedState, ()> {
+	fn create_shared_state(context: &DeviceContext) -> Result<Self::SharedState, Self::Error> {
 		let vk = &context.device;
 		unsafe {
 			let unpack_slices = vk.create_shader_module(
@@ -94,28 +100,6 @@ impl Decoder for ProRes {
 						frame_set_layout,
 						image_set_layout,
 					])
-					.push_constant_ranges(&[
-						vk::PushConstantRange::builder()
-							.stage_flags(vk::ShaderStageFlags::COMPUTE)
-							.offset(0)
-							.size(4)
-							.build(),
-						vk::PushConstantRange::builder()
-							.stage_flags(vk::ShaderStageFlags::COMPUTE)
-							.offset(4)
-							.size(4)
-							.build(),
-						vk::PushConstantRange::builder()
-							.stage_flags(vk::ShaderStageFlags::COMPUTE)
-							.offset(8)
-							.size(4)
-							.build(),
-						vk::PushConstantRange::builder()
-							.stage_flags(vk::ShaderStageFlags::COMPUTE)
-							.offset(12)
-							.size(4)
-							.build(),
-					])
 					.build(),
 				None)?;
 
@@ -127,7 +111,27 @@ impl Decoder for ProRes {
 					.build(),
 				None)?;
 
-			Ok(Self::SharedState {
+			/* TODO: Maybe there ought to be a storage class for cache persistence. */
+			let pipeline_cache = vk.create_pipeline_cache(
+				&vk::PipelineCacheCreateInfo::builder()
+					.build(),
+				None)?;
+
+			/* Pick a queue family. */
+			let queue_family_index = context.queue_family_properties()
+				.into_iter()
+				.enumerate()
+				.find(|(_, properties)| {
+					properties.queue_flags.contains(
+						vk::QueueFlags::COMPUTE
+							| vk::QueueFlags::TRANSFER)
+				})
+				.map(|(i, _)| i)
+				.unwrap() as u32;
+
+			Ok(SharedState {
+				pipeline_cache,
+				queue_family_index,
 				unpack_pipeline_layout,
 				idct_pipeline_layout,
 				unpack_slices,
@@ -142,7 +146,41 @@ impl Decoder for ProRes {
 		context: &DeviceContext,
 		shared: &Self::SharedState
 	) -> Result<Self::InstanceState, Self::Error> {
-		todo!()
+		let endianness = endian::host_endianness()?;
+		let vk = context.device();
+		unsafe {
+			let unpack_pipeline = macros::create_compute_pipeline! {
+				device: vk,
+				cache: shared.pipeline_cache,
+				layout: shared.unpack_pipeline_layout,
+				module: shared.unpack_slices,
+				entry: "main",
+				specialization: [
+					/* int cLittleEndian */
+					{ index: 0, offset: 0x00, data: endianness.flag() },
+					/* int cSubsamplingMode */
+					{ index: 1, offset: 0x04, data: &[] },
+					/* int cAlphaFormat */
+					{ index: 2, offset: 0x08, data: &[] },
+					/* int cScanningMode */
+					{ index: 3, offset: 0x0c, data: &[0] }
+				]
+			}?;
+
+			let idct_pipeline = macros::create_compute_pipeline! {
+				device: vk,
+				cache: shared.pipeline_cache,
+				layout: shared.idct_pipeline_layout,
+				module: shared.idct,
+				entry: "main",
+				specialization: []
+			}?;
+
+			Ok(InstanceState {
+				unpack_pipeline,
+				idct_pipeline
+			})
+		}
 	}
 
 	fn create_worker_state(
@@ -150,7 +188,24 @@ impl Decoder for ProRes {
 		shared: &Self::SharedState,
 		instance: &Self::InstanceState
 	) -> Result<Self::WorkerState, Self::Error> {
-		todo!()
+		let vk = context.device();
+		unsafe {
+			let command_buffer_pool = vk.create_command_pool(
+				&vk::CommandPoolCreateInfo::builder()
+					.queue_family_index(shared.queue_family_index)
+					.build(),
+				None)?;
+
+			let mut state = WorkerState {
+				command_buffer_pool,
+				descriptor_set_pool: Default::default(),
+				command_buffer_recycling_queue: Default::default(),
+				image_descriptor_set_recycling_queue: Default::default(),
+				frame_descriptor_set_recycling_queue: Default::default(),
+			};
+			let _ = state.new_descriptor_pool(context)?;
+			Ok(state)
+		}
 	}
 
 	fn create_frame_state(
@@ -158,9 +213,62 @@ impl Decoder for ProRes {
 		shared: &Self::SharedState,
 		instance: &Self::InstanceState,
 		worker: &mut Self::WorkerState,
-		image: &Image
+		image: &ImageView
 	) -> Result<Self::FrameState, Self::Error> {
-		todo!()
+
+		let vk = context.device();
+		unsafe {
+			let frame_bind = worker.get_frame_descriptor_set(context, shared)?;
+			let image_bind = worker.get_image_descriptor_set(context, shared)?;
+
+			vk.update_descriptor_sets(
+				&[
+					vk::WriteDescriptorSet::builder()
+						.dst_set(image_bind)
+						.dst_binding(0)
+						.dst_array_element(0)
+						.descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+						.image_info(&[
+							vk::DescriptorImageInfo::builder()
+								.image_layout(vk::ImageLayout::GENERAL)
+								.image_view()
+								.build(),
+							vk::DescriptorImageInfo::builder()
+								.image_layout(vk::ImageLayout::GENERAL)
+								.image_view(image.raw_handle())
+								.build()
+						])
+						.build()
+				],
+				&[])?;
+
+			let commands = worker.get_command_buffer(context)?;
+			vk.reset_command_buffer(
+				commands,
+				vk::CommandBufferResetFlags::empty())?;
+
+			vk.cmd_bind_pipeline(
+				commands,
+				vk::PipelineBindPoint::COMPUTE,
+				instance.unpack_pipeline);
+
+			vk.cmd_bind_descriptor_sets(
+				commands,
+				vk::PipelineBindPoint::COMPUTE,
+				shared.unpack_pipeline_layout,
+				0,
+				&[frame_bind],
+				&[0]);
+
+			vk.cmd_dispatch()
+
+
+			Ok(FrameState {
+				frame_bind,
+				image_bind,
+				commands,
+			})
+		}
 	}
 
 	fn destroy_shared_state(
@@ -169,8 +277,11 @@ impl Decoder for ProRes {
 	) {
 		let vk = &context.device;
 		unsafe {
+			vk.destroy_pipeline_cache(shared.pipeline_cache, None);
 			vk.destroy_shader_module(shared.unpack_slices, None);
 			vk.destroy_shader_module(shared.idct, None);
+			vk.destroy_pipeline_layout(shared.unpack_pipeline_layout, None);
+			vk.destroy_pipeline_layout(shared.idct_pipeline_layout, None);
 			vk.destroy_descriptor_set_layout(shared.image_set_layout, None);
 			vk.destroy_descriptor_set_layout(shared.frame_set_layout, None);
 		}
@@ -178,19 +289,29 @@ impl Decoder for ProRes {
 
 	fn destroy_instance_state(
 		context: &DeviceContext,
-		shared: &Self::SharedState,
+		_shared: &Self::SharedState,
 		instance: &mut Self::InstanceState
 	) {
-		todo!()
+		let vk = context.device();
+		unsafe {
+			vk.destroy_pipeline(instance.unpack_pipeline, None);
+			vk.destroy_pipeline(instance.idct_pipeline, None);
+		}
 	}
 
 	fn destroy_worker_state(
 		context: &DeviceContext,
-		shared: &Self::SharedState,
-		instance: &Self::InstanceState,
+		_shared: &Self::SharedState,
+		_instance: &Self::InstanceState,
 		worker: &mut Self::WorkerState
 	) {
-		todo!()
+		let vk = context.device();
+		unsafe {
+			vk.destroy_command_pool(worker.command_buffer_pool, None);
+			for i in worker.descriptor_set_pool {
+				vk.destroy_descriptor_pool(i, None);
+			}
+		}
 	}
 
 	fn destroy_frame_state(
@@ -205,6 +326,9 @@ impl Decoder for ProRes {
 }
 
 pub struct SharedState {
+	pipeline_cache: vk::PipelineCache,
+	queue_family_index: u32,
+
 	unpack_pipeline_layout: vk::PipelineLayout,
 	idct_pipeline_layout: vk::PipelineLayout,
 
@@ -216,52 +340,13 @@ pub struct SharedState {
 }
 
 pub struct InstanceState {
-
-}
-
-/// Instances recycling queue-related functions for all descriptor set types
-/// the worker state may wish to distinguish between.
-macro_rules! instance_descriptor_set_functions {
-	($(
-		pub unsafe (
-			$(#[$getter_meta:meta])*
-			fn $getter:ident,
-			$(#[$ret_meta:meta])*
-			fn $ret:ident
-		) => $queue:ident;
-	)*) => {$(
-		$(#[$getter_meta])*
-		pub unsafe fn $getter(
-			&mut self,
-			context: &DeviceContext,
-			shared: &SharedState,
-		) -> VkResult<vk::DescriptorSet> {
-			let vk = context.device();
-			if let Some(buffer) = self.$queue.pop_front() {
-				vk.reset_command_buffer(
-					buffer,
-					vk::CommandBufferResetFlags::empty())?;
-				Ok(buffer)
-			} else {
-				let buffers = vk.allocate_command_buffers(
-					&vk::CommandBufferAllocateInfo::builder()
-						.command_pool(self.command_buffer_pool)
-						.command_buffer_count(1)
-						.build())?;
-				Ok(buffers[0])
-			}
-		}
-
-		$(#[$ret_meta])*
-		pub unsafe fn $ret(&mut self, set: vk::DescriptorSet) {
-			self.$queue.push_back(set)
-		}
-	)*}
+	unpack_pipeline: vk::Pipeline,
+	idct_pipeline: vk::Pipeline,
 }
 
 struct WorkerState {
 	command_buffer_pool: vk::CommandPool,
-	descriptor_set_pool: vk::DescriptorPool,
+	descriptor_set_pool: LinkedList<vk::DescriptorPool>,
 	command_buffer_recycling_queue: VecDeque<vk::CommandBuffer>,
 	image_descriptor_set_recycling_queue: VecDeque<vk::DescriptorSet>,
 	frame_descriptor_set_recycling_queue: VecDeque<vk::DescriptorSet>,
@@ -289,16 +374,70 @@ impl WorkerState {
 		}
 	}
 
-	instance_descriptor_set_functions! {
+	unsafe fn new_descriptor_pool(
+		&mut self,
+		context: &DeviceContext
+	) -> VkResult<vk::DescriptorPool> {
+
+		/// Maximum number of instances that will fit in a single pool.
+		///
+		/// TODO: Having a fixed number of instances per descriptor pool is wasteful.
+		const INSTANCES: u32 = 64;
+
+		let vk = context.device();
+		let pool = unsafe {
+			vk.create_descriptor_pool(
+				&vk::DescriptorPoolCreateInfo::builder()
+					.max_sets(INSTANCES * 2)
+					.pool_sizes(&[
+						vk::DescriptorPoolSize::builder()
+							.ty(vk::DescriptorType::STORAGE_BUFFER)
+							.descriptor_count(INSTANCES * 2)
+							.build(),
+						vk::DescriptorPoolSize::builder()
+							.ty(vk::DescriptorType::STORAGE_IMAGE)
+							.descriptor_count(INSTANCES * 2)
+							.build(),
+					])
+					.build(),
+				None)?
+		};
+		self.descriptor_set_pool.push_back(pool);
+		Ok(pool)
+	}
+
+	pub unsafe fn allocate_descriptor_set(
+		&mut self,
+		context: &DeviceContext,
+		layout: vk::DescriptorSetLayout,
+	) -> VkResult<vk::DescriptorSet> {
+		let vk = context.device();
+		let attempt = |pool| unsafe {
+			vk.allocate_descriptor_sets(
+				&vk::DescriptorSetAllocateInfo::builder()
+					.descriptor_pool(pool)
+					.set_layouts(&[layout])
+					.build())
+		};
+
+		match attempt(*self.descriptor_set_pool.back().unwrap()) {
+			Ok(sets) => Ok(sets[0]),
+			Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY)
+			| Err(vk::Result::ERROR_FRAGMENTED_POOL) =>
+				Ok(attempt(self.new_descriptor_pool(context)?)?[0])
+		}
+	}
+
+	macros::instance_descriptor_set_functions! {
 		pub unsafe (
 			#[doc = "Returns a new image descriptor set."]
 			fn get_image_descriptor_set,
 			#[doc = "Recycles an old image descriptor set that's no longer in use."]
-			fn ret_image_descriptor_set
+			fn get_image_descriptor_set
 		) => image_descriptor_set_recycling_queue;
 		pub unsafe (
 			#[doc = "Returns a new frame descriptor set for."]
-			fn get_image_descriptor_set,
+			fn get_frame_descriptor_set,
 			#[doc = "Recycles an old frame descriptor set that's no longer in use."]
 			fn ret_frame_descriptor_set
 		) => frame_descriptor_set_recycling_queue;
@@ -306,8 +445,28 @@ impl WorkerState {
 }
 
 pub struct FrameState {
-	bindings: ArrayVec<vk::DescriptorSet, 4>,
+	frame_bind: vk::DescriptorSet,
+	image_bind: vk::DescriptorSet,
 	commands: vk::CommandBuffer,
+
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+	#[error("vulkan error: {0:?}")]
+	Vulkan(vk::Result),
+	#[error("system endianness is not supported")]
+	UnsupportedEndianness,
+}
+impl From<vk::Result> for Error {
+	fn from(value: vk::Result) -> Self {
+		Self::Vulkan(value)
+	}
+}
+impl From<endian::UnsupportedEndianness> for Error {
+	fn from(_: endian::UnsupportedEndianness) -> Self {
+		Self::UnsupportedEndianness
+	}
 }
 
 mod shaders {

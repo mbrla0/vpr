@@ -4,6 +4,14 @@ pub enum Endianness {
 	Big,
 	Little,
 }
+impl Endianness {
+	pub fn flag(&self) -> &'static [u8] {
+		match self {
+			Endianness::Big => &[1, 0, 0, 0],
+			Endianness::Little => &[0, 0, 0, 0]
+		}
+	}
+}
 
 /// Query the endianness of the host system.
 ///

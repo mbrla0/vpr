@@ -62,11 +62,23 @@ impl VprDeviceContext {
 /// Vulkan procedures and to manage Vulkan-related resources.
 pub struct DeviceContext {
 	pub(crate) physical_device: vk::PhysicalDevice,
+	pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
+	pub(crate) queue_family_properties: Vec<vk::QueueFamilyProperties>,
 	pub(crate) device: ash::Device,
 }
 impl DeviceContext {
-	pub fn physical_device(&self) -> &vk::PhysicalDevice { &self.physical_device }
-	pub fn device(&self) -> &ash::Device { &self.device }
+	pub fn physical_device(&self) -> &vk::PhysicalDevice {
+		&self.physical_device
+	}
+	pub fn physical_device_properties(&self) -> &vk::PhysicalDeviceProperties {
+		&self.physical_device_properties
+	}
+	pub fn device(&self) -> &ash::Device {
+		&self.device
+	}
+	pub fn queue_family_properties(&self) -> &[vk::QueueFamilyProperties] {
+		&self.queue_family_properties
+	}
 }
 impl Drop for DeviceContext {
 	fn drop(&mut self) {

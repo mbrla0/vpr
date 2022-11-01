@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::{Context, DeviceContext, Error};
 use crate::context::VprContext;
-use crate::image::{Frame, Image};
+use crate::image::{Frame, ImageView};
 
 /// Decoder.
 ///
@@ -73,7 +73,7 @@ pub trait Decoder {
 		shared: &Self::SharedState,
 		instance: &Self::InstanceState,
 		worker: &mut Self::WorkerState,
-		image: &Image) -> Result<Self::FrameState, Self::Error>;
+		image: &ImageView) -> Result<Self::FrameState, Self::Error>;
 
 	fn destroy_shared_state(
 		context: &DeviceContext,

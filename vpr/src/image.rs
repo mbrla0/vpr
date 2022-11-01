@@ -2,7 +2,7 @@ use ash::vk;
 
 pub struct Frame<'a, T> {
 	state: &'a T,
-	image: Image,
+	image: ImageView,
 	completion_fence: (bool, vk::Fence),
 	completion_semaphore: (bool, vk::Fence),
 }
@@ -13,7 +13,7 @@ impl<'a, T> Frame<'a, T> {
 	}
 
 	/// The image backing this frame.
-	pub fn image(&self) -> &Image {
+	pub fn image(&self) -> &ImageView {
 		&self.image
 	}
 
@@ -32,14 +32,14 @@ impl<'a, T> Frame<'a, T> {
 	}
 }
 
-/// Structure describing an image in device memory.
-pub struct Image {
-	image: vk::Image,
+/// Structure describing an image view in device memory.
+pub struct ImageView {
+	image: vk::ImageView,
 	format: vk::Format,
 	size: (u32, u32)
 }
-impl Image {
-	pub fn raw_handle(&self) -> vk::Image {
+impl ImageView {
+	pub fn raw_handle(&self) -> vk::ImageView {
 		self.image
 	}
 	pub fn format(&self) -> vk::Format {
