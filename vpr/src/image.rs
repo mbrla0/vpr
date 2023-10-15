@@ -4,7 +4,7 @@ pub struct Frame<'a, T> {
 	state: &'a T,
 	image: ImageView,
 	completion_fence: (bool, vk::Fence),
-	completion_semaphore: (bool, vk::Fence),
+	completion_semaphore: (bool, vk::Semaphore),
 }
 impl<'a, T> Frame<'a, T> {
 	/// The state associated with this frame.

@@ -66,9 +66,9 @@ macro_rules! create_compute_pipeline {
 			.max()
 			.unwrap_or(0);
 		let mut buffer = vec![0u8; buffer_size];
-		let mut entries = ::alloc::Vec::with_capacity(specialization.len());
+		let mut entries = Vec::with_capacity(specialization.len());
 
-		for (index, offset, data) in specializations {
+		for (index, offset, data) in specialization {
 			entries.push(::ash::vk::SpecializationMapEntry::builder()
 				.constant_id(index)
 				.offset(offset));
@@ -82,7 +82,7 @@ macro_rules! create_compute_pipeline {
 						.stage(::ash::vk::PipelineShaderStageCreateInfo::builder()
 							.stage(::ash::vk::ShaderStageFlags::COMPUTE)
 							.module($shader)
-							.name(::c_str::c_str!($entry))
+							.name(::c_str_macro::c_str!($entry))
 							.specialization_info(&::ash::vk::SpecializationInfo::builder()
 								.map_entries(&entries)
 								.data(&buffer)
@@ -96,5 +96,5 @@ macro_rules! create_compute_pipeline {
 	}}
 }
 
-pub use instance_descriptor_set_functions;
-pub use create_compute_pipeline;
+pub(crate) use instance_descriptor_set_functions;
+pub(crate) use create_compute_pipeline;

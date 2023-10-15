@@ -1,7 +1,7 @@
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use crate::{Context, DeviceContext, Error};
+use crate::{Context, DeviceContext, Dimensions, Error};
 use crate::context::VprContext;
 use crate::image::{Frame, ImageView};
 
@@ -16,7 +16,7 @@ use crate::image::{Frame, ImageView};
 /// into Vulkan concepts, in order to keep any eventual overhead as a result of
 /// translating between them down to a minimum.
 ///
-/// The before-mentioned categories of locality are as follows:
+/// The aforementioned categories of locality are as follows:
 ///
 /// - Shared: Shared amongst all decoder instances on a device and amongst all
 /// 		  cores in the system.
@@ -41,13 +41,14 @@ pub trait Decoder {
 	/// Error type used by this decoder.
 	type Error;
 
-	/// Consume raw encoded data and schedule frames for decoding
+	/// Consume raw encoded data and schedule frames for decoding, returning how many bytes were
+	/// consumed by this call.
 	fn schedule(&self,
 		context: &DeviceContext,
 		shared: &Self::SharedState,
 		instance: &mut Self::InstanceState,
-		frames: &DecodeScheduler<Self>,
-		data: &[u8]) -> Result<(), Self::Error>;
+		frames: &mut DecodeScheduler<Self>,
+		data: &[u8]) -> Result<usize, Self::Error>;
 
 	/// Perform the decoding of the frame.
 	fn decode(&self,
@@ -122,18 +123,20 @@ pub struct DecodeScheduler<'a, C>
 	where C: Decoder {
 
 	source: &'a [u8],
-	frames: Vec<(&'a [u8], C::FrameParam)>,
+	frames: Vec<(&'a [u8], Dimensions, C::FrameParam)>,
 	_bind: std::marker::PhantomData<C>,
 }
-impl<C> DecodeScheduler<C>
+impl<'a, C> DecodeScheduler<'a, C>
 	where C: Decoder {
 
+	/// Schedule a new frame with the data covering the given range and parameter.
 	pub fn schedule<R>(
 		&mut self,
 		data: R,
+		dimensions: Dimensions,
 		param: C::FrameParam)
 		where R: RangeBounds<usize> {
 
-		self.frames.push((&self.source[data], param))
+		self.frames.push((&self.source[data], dimensions, param))
 	}
 }

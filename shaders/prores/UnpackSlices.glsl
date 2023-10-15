@@ -16,7 +16,8 @@ struct IndexEntry
 	uint offset;
 	uint position;
 	uint coded_size;
-};	
+	uint padding0;
+};
 
 layout(set = 0, binding = 0, std430) restrict readonly buffer _FrameHeader
 {

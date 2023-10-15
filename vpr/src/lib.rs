@@ -1,7 +1,7 @@
+#![feature(split_array)]
 //! Vulkan ProRes
 //!
 //! This crate provides an interface to
-#![feature(const_ptr_read)]
 
 mod error;
 mod prores;
@@ -106,6 +106,12 @@ impl Instance {
 
 		todo!()
 	}
+}
+
+/// Structure describing the dimensions of an image.
+pub struct Dimensions {
+	pub width: u32,
+	pub height: u32,
 }
 
 /// The requirements for a given physical device to be suitable.

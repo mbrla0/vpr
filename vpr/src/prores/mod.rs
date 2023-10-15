@@ -3,17 +3,48 @@ use std::collections::vec_deque::VecDeque;
 use arrayvec::ArrayVec;
 use ash::prelude::VkResult;
 use crate::decoder::Decoder;
-use crate::{VprContext, DecodeScheduler, DeviceContext};
+use crate::{VprContext, DecodeScheduler, DeviceContext, Dimensions};
 
 use ash::vk;
+use byteorder::{BigEndian, ReadBytesExt};
 use crate::image::{Frame, ImageView};
 
-mod syntax;
+mod parser;
 mod endian;
 mod macros;
 
+/// An analogue for the `IndexEntry` struct in `UnpackSlices.glsl`.
+#[repr(C)]
+struct UnpackSlicesIndexEntry {
+	/// The offset of the start of the slice.
+	offset: u32,
+	/// The coded position and size of the slice.
+	///
+	/// This is a bit-packed structure with the following fields:
+	/// - `0..16`: Width in macroblocks.
+	/// - `16..30`: Height in macroblocks.
+	/// - `30..32`: log2(Size of the slice in macroblocks).
+	position: u32,
+	/// The size of the compressed slice data, in bytes.
+	coded_size: u32,
+	/// Padding value.
+	///
+	/// It is explicitly defined in the shader, so it may have any value. It is polite to leave it
+	/// set to zero, however, as removing the field in the shader will restrict it to that value.
+	padding0: u32,
+}
+
 pub struct ProRes;
 impl ProRes {
+	/// ProRes frames all have a special bit string that comes right after the frame size.
+	///
+	/// Checking for the presence of the string lets us check if the data we're reading is probably
+	/// in the correct format and correctly aligned, as opposed to being just some random bytes we
+	/// happened to receive or land on.
+	const FRAME_IDENTIFIER: &'static [u8; 4] = b"icpf";
+
+	/// This is the maximum length of a slice, measured in macroblocks, in log2.
+	const MAX_LOG2_MB_SLICE_SIZE: u8 = 3;
 }
 impl Decoder for ProRes {
 	type SharedState = SharedState;
@@ -27,10 +58,60 @@ impl Decoder for ProRes {
 		context: &DeviceContext,
 		shared: &Self::SharedState,
 		instance: &mut Self::InstanceState,
-		frames: &DecodeScheduler<Self>,
+		frames: &mut DecodeScheduler<Self>,
 		data: &[u8]
-	) -> Result<(), Self::Error> {
-		todo!()
+	) -> Result<usize, Self::Error> {
+		if data.len() < 4 {
+			/* Not enough data to know how long the next frame is. */
+			return Ok(0)
+		}
+
+		/* This procedure is gonna be running in a single thread, so we want it to be over as soon
+		 * as possible. Just divvy up the frames as quickly as we can so that the workers can deal
+		 * with them in parallel. */
+		let mut cursor = data;
+		let mut offset = 0;
+		loop {
+			if cursor.len() < 8 { break }
+			let len: usize = cursor.read_u32::<BigEndian>().unwrap().try_into().unwrap();
+			let sig = cursor.split_array_ref::<4>().0.clone();
+			cursor = &cursor[4..];
+
+			/* Reject the data if the signature on it doesn't match the frame identifier. */
+			if sig != Self::FRAME_IDENTIFIER {
+				return Err(Self::Error::InvalidFrameSignature(sig))
+			}
+
+			/* Wait for the full frame to become available before we schedule it. Hopefully the
+			 * length we read isn't corrupted or wrong, or we'll be waiting until the end of the
+			 * data before we realize there's something wrong. */
+			if cursor.len() < len { break }
+
+			/* Before we try to parse anything out, make sure the data is at least long enough that
+			 * we can read the fields we're interested in for the scheduling. Right now, we don't
+			 * care if the frame structure has enough data to produce an image, we can leave these
+			 * more thorough checks to the parallel workers. */
+			if cursor.len() < 12 {
+				return Err(Self::Error::UnexpectedEndOfFrame)
+			}
+
+			/* Skip until the dimensions inside the frame header and read them. We currently ignore
+			 * all of the data in the header until this point. */
+			cursor = &cursor[8..];
+
+			let mut dimensions = [0u16; 2];
+			cursor.read_u16_into::<BigEndian>(&mut dimensions).unwrap();
+
+			let dimensions = Dimensions {
+				width: u32::from(dimensions[0]),
+				height: u32::from(dimensions[1])
+			};
+
+			frames.schedule(offset..offset + len, dimensions, ());
+			offset += len;
+		}
+
+		Ok(offset)
 	}
 
 	fn decode(&self,
@@ -39,10 +120,53 @@ impl Decoder for ProRes {
 		instance: &Self::InstanceState,
 		worker: &mut Self::WorkerState,
 		frame: &mut Frame<Self::FrameState>,
-		param: Self::FrameParam,
+		_param: Self::FrameParam,
 		data: &[u8]
 	) {
-		todo!()
+		let frame_parser = parser::Frame::new(data).unwrap();
+
+		/* Construct the slice layout of the picture.
+		 *
+		 * We have to scan through the slices in order to divvy up the work amongst the threads in
+		 * the device, with each thread processing a single slice.
+		 *
+		 * Additionally, the shaders handle the image in macroblock units, but the bitstream simply
+		 * lays slices out such that they appear in scan order, from left to right, top to bottom.
+		 * This means we have to derive this information from the slices, as well as how many
+		 * macroblocks each individual slice corresponds to, before the shader is invoked.
+		 */
+		let mb_width = ((frame_parser.header().horizontal_size() as u32 + 15) / 16) as u16;
+		let mb_height = ((frame_parser.header().horizontal_size() as u32 + 15) / 16) as u16;
+
+		let slice_count_per_row = {
+			/* Because slices sizes are guaranteed to be powers of two, and have a maximum size of
+			 * eight, we may simply add the unsigned number after bit offset 3 to the number of set
+			 * bits below that offset.
+			 *
+			 * To illustrate why this works, imagine the width of the row as being given by the
+			 * following unsigned integer in binary representation:
+			 *
+			 * |-----------------|-------|
+			 * | . . . 1 1 1 1 1 | 1 1 1 |
+			 * |--------A--------|---B---|
+			 *
+			 * Section A is, obviously, the maximum number of 8-sized slices that can be used to
+			 * cover the area of a row, as it is the same as the result of the division of the width
+			 * by 8. Section B, meanwhile, gives us the exact number of each of the remaining slice
+			 * sizes that are needed to fill the rest of the area in the same row, using the fewest
+			 * number of slices possible.
+			 *
+			 * The same logic applies to all possible values for the maximum size of a slice,
+			 * provided that the bit offset that separates regions A and B is set appropriately.
+			 */
+			let div = mb_width >> Self::MAX_LOG2_MB_SLICE_SIZE;
+			let rem = mb_width % (1 << Self::MAX_LOG2_MB_SLICE_SIZE);
+
+			div + rem.count_ones()
+		};
+		let slice_lengths = frame_parser.picture0().read_slice_sizes(mb_height, slice_count_per_row)
+			.map(|(x, y, val)|)
+			.collect::<>
 	}
 
 	fn create_shared_state(context: &DeviceContext) -> Result<Self::SharedState, Self::Error> {
@@ -175,6 +299,12 @@ impl Decoder for ProRes {
 				entry: "main",
 				specialization: []
 			}?;
+
+			let spread_pipeline = macros::create_compute_pipeline! {
+				device: vk,
+				cache: shared.pipeline_cache,
+
+			};
 
 			Ok(InstanceState {
 				unpack_pipeline,
@@ -331,17 +461,26 @@ pub struct SharedState {
 
 	unpack_pipeline_layout: vk::PipelineLayout,
 	idct_pipeline_layout: vk::PipelineLayout,
+	spread_pipeline_layout: vk::PipelineLayout,
 
 	unpack_slices: vk::ShaderModule,
 	idct: vk::ShaderModule,
+	spread: vk::ShaderModule,
 
 	image_set_layout: vk::DescriptorSetLayout,
 	frame_set_layout: vk::DescriptorSetLayout,
 }
 
 pub struct InstanceState {
+	decoder_state: DecoderState,
+
 	unpack_pipeline: vk::Pipeline,
 	idct_pipeline: vk::Pipeline,
+	spread_pipeline: vk::Pipeline,
+}
+
+enum DecoderState {
+
 }
 
 struct WorkerState {
@@ -433,7 +572,7 @@ impl WorkerState {
 			#[doc = "Returns a new image descriptor set."]
 			fn get_image_descriptor_set,
 			#[doc = "Recycles an old image descriptor set that's no longer in use."]
-			fn get_image_descriptor_set
+			fn ret_image_descriptor_set
 		) => image_descriptor_set_recycling_queue;
 		pub unsafe (
 			#[doc = "Returns a new frame descriptor set for."]
@@ -457,6 +596,10 @@ pub enum Error {
 	Vulkan(vk::Result),
 	#[error("system endianness is not supported")]
 	UnsupportedEndianness,
+	#[error("frame contains invalid identifier: {0:?}")]
+	InvalidFrameSignature([u8; 4]),
+	#[error("frame data ends sooner than expected")]
+	UnexpectedEndOfFrame
 }
 impl From<vk::Result> for Error {
 	fn from(value: vk::Result) -> Self {
