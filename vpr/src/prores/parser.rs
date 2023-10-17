@@ -221,6 +221,4 @@ impl<'a> PictureHeader<'a> {
 	pub fn reserved2(&self) -> u8 {
 		self.0[7] & 15
 	}
-
-	pub fn
 }

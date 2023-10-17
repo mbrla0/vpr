@@ -23,7 +23,7 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 1, rgba32f) restrict readonly  uniform image2D ComponentImage;
-layout(set = 0, binding = 2, rgba32f) restrict writeonly uniform image2D FinalImage;
+layout(set = 1, binding = 0, rgba32f) restrict writeonly uniform image2D FinalImage;
 
 void main()
 {

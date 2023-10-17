@@ -3,6 +3,9 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::mem::{ManuallyDrop};
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering::SeqCst;
+use ash::prelude::VkResult;
 use ash::vk;
 use crate::Decoder;
 
@@ -61,10 +64,17 @@ impl VprDeviceContext {
 /// It is the structure providing codecs with the ability to directly call into
 /// Vulkan procedures and to manage Vulkan-related resources.
 pub struct DeviceContext {
-	pub(crate) physical_device: vk::PhysicalDevice,
-	pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
-	pub(crate) queue_family_properties: Vec<vk::QueueFamilyProperties>,
-	pub(crate) device: ash::Device,
+	physical_device: vk::PhysicalDevice,
+	physical_device_properties: vk::PhysicalDeviceProperties,
+	physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+	queue_family_properties: Vec<vk::QueueFamilyProperties>,
+	device: ash::Device,
+
+	/// We use this to keep track of the allocations we've made.
+	///
+	/// In Vulkan, trying to allocate one past the limit is undefined behavior, and so we have to at
+	/// least keep track of the number of allocations so we don't go past that limit.
+	allocation_count: AtomicU32,
 }
 impl DeviceContext {
 	pub fn physical_device(&self) -> &vk::PhysicalDevice {
@@ -79,6 +89,35 @@ impl DeviceContext {
 	pub fn queue_family_properties(&self) -> &[vk::QueueFamilyProperties] {
 		&self.queue_family_properties
 	}
+	pub fn physical_device_memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+		&self.physical_device_memory_properties
+	}
+
+	/// Tries to allocate memory on the device, failing if the maximum number of allocations would
+	/// be exceeded.
+	///
+	///
+	pub unsafe fn allocate_memory(&self, param: &vk::MemoryAllocateInfo)
+		-> Result<VkResult<vk::DeviceMemory>, TooManyAllocations> {
+
+		let max_allocations = self.physical_device_properties.limits.max_memory_allocation_count;
+		let result = self.allocation_count.fetch_update(SeqCst, SeqCst, |val| {
+			if val >= max_allocations {
+				None
+			} else {
+				Some(max_allocations + 1)
+			}
+		});
+		match result {
+			Ok(_) => Ok(self.device.allocate_memory(param, None)),
+			Err(_) => Err(TooManyAllocations)
+		}
+	}
+
+	/// Frees allocations previously acquired from [`Self::allocate_memory`].
+	pub unsafe fn free_memory(&self, param: vk::DeviceMemory) {
+		self.device.free_memory(param, None)
+	}
 }
 impl Drop for DeviceContext {
 	fn drop(&mut self) {
@@ -88,6 +127,15 @@ impl Drop for DeviceContext {
 		}
 	}
 }
+
+/// This error indicates that too many allocations have been made on a target device.
+///
+/// It is only triggered when calling the [`DeviceContext::allocate_memory`] function, which keeps
+/// track of the number of allocations made on the device, so that the user will get this error
+/// instead of triggering undefined behavior.
+#[derive(Debug, thiserror::Error)]
+#[error("the allocation limit has been exceeded on the target device")]
+pub struct TooManyAllocations;
 
 /// Write-once-read-many storage structure for shared values of heterogeneous
 /// type.

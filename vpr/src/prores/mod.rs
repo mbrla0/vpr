@@ -1,5 +1,7 @@
 use std::collections::linked_list::LinkedList;
 use std::collections::vec_deque::VecDeque;
+use std::ops::{Add, Range};
+use std::ptr::NonNull;
 use arrayvec::ArrayVec;
 use ash::prelude::VkResult;
 use crate::decoder::Decoder;
@@ -33,6 +35,62 @@ struct UnpackSlicesIndexEntry {
 	/// set to zero, however, as removing the field in the shader will restrict it to that value.
 	padding0: u32,
 }
+impl UnpackSlicesIndexEntry {
+	pub fn encode(&self, target: &mut [u8; 16]) {
+		target[0..4].copy_from_slice(&self.offset.to_ne_bytes());
+		target[4..8].copy_from_slice(&self.position.to_ne_bytes());
+		target[8..12].copy_from_slice(&self.coded_size.to_ne_bytes());
+		target[12..16].copy_from_slice(&self.padding0.to_ne_bytes());
+	}
+}
+
+/// An analogue for the quantization matrix data in `UnpackSlices.glsl`
+#[repr(C)]
+struct UnpackSlicesQuantizationMatrices {
+	luma_quantization_matrix: [u8; 64],
+	chroma_quantization_matrix: [u8; 64]
+}
+impl UnpackSlicesQuantizationMatrices {
+	pub fn encode(&self, target: &mut [u8; 128]) {
+		target[0..64].copy_from_slice(&self.luma_quantization_matrix);
+		target[64..128].copy_from_slice(&self.chroma_quantization_matrix);
+	}
+}
+
+/// Iterator that yields all of the elements in a prefix accumulation.
+struct PrefixAccumulate<I: Iterator, F> {
+	iter: I,
+	acc: Option<I::Item>,
+	map: F,
+}
+impl<I: Iterator, F> Iterator for PrefixAccumulate<I, F>
+	where I::Item: Clone,
+		  F: FnMut(Option<I::Item>, I::Item) -> I::Item {
+
+	type Item = I::Item;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let next = self.iter.next()?;
+		let result = Some(match self.acc.take() {
+			None => next,
+			Some(prev) => (self.map)(prev, next)
+		});
+
+		self.acc = result.clone();
+		result
+	}
+}
+trait PrefixAccumulateIterExt: Iterator {
+	fn prefix_acc<F>(self, map: F) -> PrefixAccumulate<Self, F>
+		where F: FnMut(Option<Self::Item>, Self::Item) -> Self::Item {
+		PrefixAccumulate {
+			iter: self,
+			acc: None,
+			map,
+		}
+	}
+}
+impl<I: Iterator> PrefixAccumulateIterExt for I {}
 
 pub struct ProRes;
 impl ProRes {
@@ -45,6 +103,13 @@ impl ProRes {
 
 	/// This is the maximum length of a slice, measured in macroblocks, in log2.
 	const MAX_LOG2_MB_SLICE_SIZE: u8 = 3;
+
+	/// Default luma quantization matrix.
+	///
+	/// When a frame does not specify its own Y quantization matrix, this one should be used,
+	/// instead. When the CbCr quantization matrix is not specified, it should be the same as the
+	/// one used for the Y component.
+	const DEFAULT_LUMA_QUANTIZATION_MATRIX: [u8; 64] = [4; 64];
 }
 impl Decoder for ProRes {
 	type SharedState = SharedState;
@@ -164,9 +229,47 @@ impl Decoder for ProRes {
 
 			div + rem.count_ones()
 		};
-		let slice_lengths = frame_parser.picture0().read_slice_sizes(mb_height, slice_count_per_row)
-			.map(|(x, y, val)|)
-			.collect::<>
+		let slice_count = vk::DeviceSize::from(slice_count_per_row * mb_height);
+
+		let index_size =
+			(std::mem::size_of::<UnpackSlicesQuantizationMatrices>() as vk::DeviceSize)
+				.checked_add((std::mem::size_of::<UnpackSlicesIndexEntry>() as vk::DeviceSize)
+					.checked_mul(slice_count)
+					.unwrap())
+				.unwrap();
+		let picture_data_size = frame_parser.picture0()
+			.read_slice_sizes(mb_height, slice_count_per_row)
+			.map(|(_x, _y, size)| vk::DeviceSize::from(size))
+			.reduce(|size0, size1| size0.checked_add(size1).unwrap())
+			.unwrap();
+
+		/* Upload the picture data to the device. */
+		if !worker.upload_memory_large_enough(index_size, picture_data_size) {
+			unsafe {
+				worker.realloc_upload_memory(context, shared, index_size, picture_data_size);
+			}
+		}
+		let upload_memory = worker.upload_memory();
+		let upload_memory_map = unsafe {
+			let i: isize = upload_memory.allocation_size.try_into().unwrap();
+			std::slice::from_raw_parts_mut(
+				upload_memory.map.as_ptr(),
+				i as usize
+			)
+		};
+
+		let luma_quantization_matrix = frame_parser.header().luma_quantization_matrix()
+			.unwrap_or(&Self::DEFAULT_LUMA_QUANTIZATION_MATRIX);
+		let chroma_quantization_matrix = frame_parser.header().chroma_quantization_matrix()
+			.unwrap_or(luma_quantization_matrix);
+		UnpackSlicesQuantizationMatrices {
+			luma_quantization_matrix: *luma_quantization_matrix,
+			chroma_quantization_matrix: *chroma_quantization_matrix,
+		}.encode(&mut upload_memory_map[0..128].try_into().unwrap());
+
+		for (x, y, len) in frame_parser.picture0().read_slice_sizes(mb_height, slice_count_per_row) {
+
+		}
 	}
 
 	fn create_shared_state(context: &DeviceContext) -> Result<Self::SharedState, Self::Error> {
@@ -483,14 +586,140 @@ enum DecoderState {
 
 }
 
+struct UploadMemory {
+	index_buffer_offset: vk::DeviceSize,
+	index_buffer_size: vk::DeviceSize,
+	index_buffer: vk::Buffer,
+
+	picture_data_buffer_offset: vk::DeviceSize,
+	picture_data_buffer_size: vk::DeviceSize,
+	picture_data_buffer: vk::Buffer,
+
+	allocation_size: vk::DeviceSize,
+	allocation: vk::DeviceMemory,
+	map: NonNull<u8>
+}
+
+struct OnDeviceMemory {
+	allocation_size: usize,
+	allocation: vk::DeviceMemory,
+}
+
 struct WorkerState {
 	command_buffer_pool: vk::CommandPool,
 	descriptor_set_pool: LinkedList<vk::DescriptorPool>,
 	command_buffer_recycling_queue: VecDeque<vk::CommandBuffer>,
 	image_descriptor_set_recycling_queue: VecDeque<vk::DescriptorSet>,
 	frame_descriptor_set_recycling_queue: VecDeque<vk::DescriptorSet>,
+
+	upload_memory: Option<UploadMemory>,
+	on_device_memory: Option<OnDeviceMemory>,
 }
 impl WorkerState {
+	pub fn upload_memory(&self) -> &UploadMemory {
+		self.upload_memory.as_ref().unwrap()
+	}
+
+	/// Reports whether the current buffers are large enough for the given data.
+	pub fn upload_memory_large_enough(
+		&self,
+		index_size: vk::DeviceSize,
+		picture_data_size: vk::DeviceSize
+	) -> bool {
+		let index_buffer_large_enough = self.upload_memory
+			.map(|a| a.index_buffer_size >= index_size)
+			.unwrap_or(false);
+		let picture_data_buffer_large_enough = self.upload_memory
+			.map(|a| a.picture_data_buffer_size >= picture_data_size)
+			.unwrap_or(false);
+
+		index_buffer_large_enough && picture_data_buffer_large_enough
+	}
+
+	/// Reallocates the upload memory allocation and sets up new buffers for it.
+	pub unsafe fn realloc_upload_memory(
+		&mut self,
+		context: &DeviceContext,
+		shared: &SharedState,
+		index_size: vk::DeviceSize,
+		picture_data_size: vk::DeviceSize,
+	) {
+		let build_buffer = |size| context.device()
+			.create_buffer(&vk::BufferCreateInfo::builder()
+				.size(index_size)
+				.usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+				.build(), None)
+			.unwrap();
+
+		let index_buffer = build_buffer(index_size);
+		let picture_data_buffer = build_buffer(picture_data_size);
+
+		let index_memreq = context.device().get_buffer_memory_requirements(index_buffer);
+		let picture_data_memreq = context.device().get_buffer_memory_requirements(picture_data_buffer);
+		let padding0 = picture_data_memreq.alignment - index_memreq.size % picture_data_memreq.alignment;
+
+		let total_size =
+			index_memreq.size
+				.checked_add(picture_data_memreq.size)
+				.unwrap()
+				.checked_add(padding0)
+				.unwrap();
+
+		let requires_new_allocation = self.upload_memory
+			.as_ref()
+			.map(|upload_memory| upload_memory.allocation_size < total_size)
+			.unwrap_or(true);
+
+		let allocation = if requires_new_allocation {
+			context.allocate_memory(&vk::MemoryAllocateInfo::builder()
+				.allocation_size(total_size)
+				.memory_type_index(shared.upload_memory_type)
+				.build())
+				.unwrap()
+				.unwrap()
+		} else {
+			self.upload_memory.as_ref().unwrap().allocation
+		};
+
+		context.device().bind_buffer_memory(
+			index_buffer,
+			allocation,
+			0
+		).unwrap();
+
+		context.device().bind_buffer_memory(
+			picture_data_buffer,
+			allocation,
+			index_memreq.size + padding0
+		).unwrap();
+
+		let (mapped_length, map) = match self.upload_memory.take() {
+			Some(upload_memory) => {
+				context.device().destroy_buffer(upload_memory.index_buffer, None);
+				context.device().destroy_buffer(upload_memory.picture_data_buffer, None);
+
+				if requires_new_allocation {
+					context.free_memory(upload_memory.allocation);
+					(0, None)
+				} else { (upload_memory.mapped_length, upload_memory.map) }
+			},
+			None => (0, None)
+		};
+
+		self.upload_memory = Some(UploadMemory {
+			index_buffer_offset: 0,
+			index_buffer_size: index_memreq.size,
+			index_buffer,
+			picture_data_buffer_offset: index_memreq.size + padding0,
+			picture_data_buffer_size: picture_data_memreq.size,
+			picture_data_buffer,
+			allocation_size: total_size,
+			allocation,
+			mapped_length,
+			map,
+		});
+	}
+
 	/// Recycles an already existing command buffer or creates a new one if none
 	/// are available and returns it.
 	pub unsafe fn get_command_buffer(
