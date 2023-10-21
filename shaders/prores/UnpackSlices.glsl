@@ -16,7 +16,7 @@ struct IndexEntry
 	uint offset;
 	uint position;
 	uint coded_size;
-	uint padding0;
+	uint coded0;
 };
 
 layout(set = 0, binding = 0, std430) restrict readonly buffer _FrameHeader
@@ -532,9 +532,9 @@ void main()
 			- coded_size_of_cb_data;  
 	
 	uvec2 slice_mb_offset = uvec2(
-		(INPUT_SLICE.position & 0x00007fffU) >> 0,
-		(INPUT_SLICE.position & 0x3fff8000U) >> 15);
-	uint log2_slice_len_mb = (INPUT_SLICE.position & 0xc0000000U) >> 30;
+		(INPUT_SLICE.position & 0x0000ffffU) >> 0,
+		(INPUT_SLICE.position & 0xffff0000U) >> 16);
+	uint log2_slice_len_mb = (INPUT_SLICE.coded0 & 0x00000003U) >> 0;
 
 	/* Seek the cursor to the start of the coded color data. */
 	cursor_seek(

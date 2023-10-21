@@ -1,11 +1,10 @@
 use std::collections::linked_list::LinkedList;
 use std::collections::vec_deque::VecDeque;
-use std::ops::{Add, Range};
+use std::intrinsics::unlikely;
 use std::ptr::NonNull;
-use arrayvec::ArrayVec;
 use ash::prelude::VkResult;
 use crate::decoder::Decoder;
-use crate::{VprContext, DecodeScheduler, DeviceContext, Dimensions};
+use crate::{DecodeScheduler, DeviceContext, Dimensions};
 
 use ash::vk;
 use byteorder::{BigEndian, ReadBytesExt};
@@ -24,23 +23,22 @@ struct UnpackSlicesIndexEntry {
 	///
 	/// This is a bit-packed structure with the following fields:
 	/// - `0..16`: Width in macroblocks.
-	/// - `16..30`: Height in macroblocks.
-	/// - `30..32`: log2(Size of the slice in macroblocks).
+	/// - `16..32`: Height in macroblocks.
 	position: u32,
 	/// The size of the compressed slice data, in bytes.
 	coded_size: u32,
-	/// Padding value.
+	/// Coded miscellaneous data.
 	///
-	/// It is explicitly defined in the shader, so it may have any value. It is polite to leave it
-	/// set to zero, however, as removing the field in the shader will restrict it to that value.
-	padding0: u32,
+	/// This is a bit-packed structure with the following fields:
+	/// - `0..2`: log2(Number of macroblocks in the slice).
+	coded0: u32,
 }
 impl UnpackSlicesIndexEntry {
 	pub fn encode(&self, target: &mut [u8; 16]) {
 		target[0..4].copy_from_slice(&self.offset.to_ne_bytes());
 		target[4..8].copy_from_slice(&self.position.to_ne_bytes());
 		target[8..12].copy_from_slice(&self.coded_size.to_ne_bytes());
-		target[12..16].copy_from_slice(&self.padding0.to_ne_bytes());
+		target[12..16].copy_from_slice(&self.coded0.to_ne_bytes());
 	}
 }
 
@@ -110,12 +108,34 @@ impl ProRes {
 	/// instead. When the CbCr quantization matrix is not specified, it should be the same as the
 	/// one used for the Y component.
 	const DEFAULT_LUMA_QUANTIZATION_MATRIX: [u8; 64] = [4; 64];
+
+	/// The maximum number of descriptor sets that can be used by a single worker.
+	///
+	/// Currently, each worker has its own descriptor pool, and this value together with the ones
+	/// like it control how many resources each worker may use. Additionally, the number of
+	/// descriptors and sets used by a single worker is `O(1)`, and, therefore, the number in this
+	/// constant should be the exact maximum.
+	///
+	/// If descriptor set allocation is failing for a worker, you should either check again that you
+	/// haven't missed any descriptor sets or that any changes you have made have it so that the
+	/// upper bound on the number of descriptors isn't constant anymore.
+	const MAX_WORKER_DESCRIPTOR_SETS: u32 = 2;
+
+	/// The maximum number of storage buffer descriptors that can be used by a single worker.
+	///
+	/// See [`Self::MAX_WORKER_DESCRIPTOR_SETS`] for more information.
+	const MAX_WORKER_STORAGE_BUFFER_DESCRIPTORS: u32 = 2;
+
+	/// The maximum number of storage image descriptors that can be used by a single worker.
+	///
+	/// See [`Self::MAX_WORKER_DESCRIPTOR_SETS`] for more information.
+	const MAX_WORKER_STORAGE_IMAGE_DESCRIPTORS: u32 = 2;
 }
 impl Decoder for ProRes {
 	type SharedState = SharedState;
-	type InstanceState = InstanceState;
+	type InstanceState = ();
 	type WorkerState = WorkerState;
-	type FrameState = FrameState;
+	type FrameState = ();
 	type FrameParam = ();
 	type Error = Error;
 
@@ -187,7 +207,8 @@ impl Decoder for ProRes {
 		frame: &mut Frame<Self::FrameState>,
 		_param: Self::FrameParam,
 		data: &[u8]
-	) {
+	) -> Result<(), Self::Error> {
+
 		let frame_parser = parser::Frame::new(data).unwrap();
 
 		/* Construct the slice layout of the picture.
@@ -244,10 +265,12 @@ impl Decoder for ProRes {
 			.unwrap();
 
 		/* Upload the picture data to the device. */
+		let mut must_invalidate_command_buffers = false;
 		if !worker.upload_memory_large_enough(index_size, picture_data_size) {
 			unsafe {
 				worker.realloc_upload_memory(context, shared, index_size, picture_data_size);
 			}
+			must_invalidate_command_buffers = true;
 		}
 		let upload_memory = worker.upload_memory();
 		let upload_memory_map = unsafe {
@@ -257,6 +280,7 @@ impl Decoder for ProRes {
 				i as usize
 			)
 		};
+		let mut cursor = upload_memory_map;
 
 		let luma_quantization_matrix = frame_parser.header().luma_quantization_matrix()
 			.unwrap_or(&Self::DEFAULT_LUMA_QUANTIZATION_MATRIX);
@@ -265,15 +289,103 @@ impl Decoder for ProRes {
 		UnpackSlicesQuantizationMatrices {
 			luma_quantization_matrix: *luma_quantization_matrix,
 			chroma_quantization_matrix: *chroma_quantization_matrix,
-		}.encode(&mut upload_memory_map[0..128].try_into().unwrap());
+		}.encode(&mut cursor[..128].try_into().unwrap());
+		cursor = &mut cursor[128..];
 
-		for (x, y, len) in frame_parser.picture0().read_slice_sizes(mb_height, slice_count_per_row) {
+		let mut last_offset = 0;
+		let mut last_row = 0;
+		let mut last_x = 0;
+		let mut special_slice_index = 0;
+		for (slice_no, row, len) in frame_parser.picture0().read_slice_sizes(mb_height, slice_count_per_row) {
+			if last_row != row {
+				last_x = 0;
+				last_row = row;
+				special_slice_index = 0;
+			}
 
+			/* We can assume that, until the last MAX_LOG2_MB_SLICE_SIZE slices in a row, all of the
+			 * slices will have the maximum allowed size, which allows us to skip the somewhat more
+			 * involved size calculation for the vast majority of the slices in a picture. */
+			let slice_from_end = slice_no - slice_count_per_row - 1;
+			let log2_slice_size = if unlikely(slice_from_end < u16::from(Self::MAX_LOG2_MB_SLICE_SIZE)) {
+				let mask = 1 << (Self::MAX_LOG2_MB_SLICE_SIZE - special_slice_index) - 1;
+				let zeroes = (mb_width & mask).trailing_zeros();
+
+				/* We already know this slice exists. So if we don't find any set bits in the mask
+				 * it's either because we're either checking against the wrong size of integer, or
+				 * because our bit operations are wrong. Regardless, it's a bug. */
+				debug_assert!(zeroes < u16::BITS);
+
+				let size = (u16::BITS - zeroes) as u8;
+				special_slice_index += 1;
+				size
+			} else { Self::MAX_LOG2_MB_SLICE_SIZE };
+
+			UnpackSlicesIndexEntry {
+				offset: last_offset,
+				position: u32::from(row) << 16 | u32::from(last_x),
+				coded_size: 0,
+				coded0: u32::from(log2_slice_size),
+			}.encode(&mut cursor[..16].try_into().unwrap());
+			cursor = &mut cursor[..16];
+
+			last_x = last_x + 1u16 << log2_slice_size as u16;
 		}
+		unsafe {
+			context.device().flush_mapped_memory_ranges(&[vk::MappedMemoryRange::builder()
+				.offset(0)
+				.size(upload_memory.allocation_size)
+				.memory(upload_memory.allocation)
+				.build()])
+				.unwrap();
+		}
+
+		/* Update the internal image buffers so that we can be sure they'll be able to contain the
+		 * data for this frame. Additionally, we have to make sure that the size of the working set
+		 * of images is rounded up to fit the next whole number of macroblocks, as is required by
+		 * ProRes. */
+
+		let coefficient_image_extent = vk::Extent2D {
+			width: u32::from(mb_width) * 16,
+			height: u32::from(mb_height) * 16,
+		};
+		let component_image_extent = coefficient_image_extent;
+
+		if !worker.on_device_memory_large_enough(coefficient_image_extent, component_image_extent) {
+			unsafe {
+				worker.realloc_on_device_memory(
+					context,
+					shared,
+					coefficient_image_extent,
+					component_image_extent
+				)
+			}
+			must_invalidate_command_buffers = true;
+		}
+
+		/* Dispatch. */
+		if must_invalidate_command_buffers {
+			worker.invalidate_command_buffers(context);
+		}
+		let command_buffer = unsafe {
+			worker.command_buffer(
+				context,
+				shared,
+				frame,
+				FrameLayout {
+					mb_width,
+					mb_height,
+					slice_count_per_row,
+				},
+				ScanBehavior::Progressive,
+				SubsamplingFormat::Subsampling422)
+		}.unwrap();
+
+		Ok(())
 	}
 
 	fn create_shared_state(context: &DeviceContext) -> Result<Self::SharedState, Self::Error> {
-		let vk = &context.device;
+		let vk = context.device();
 		unsafe {
 			let unpack_slices = vk.create_shader_module(
 				&vk::ShaderModuleCreateInfo::builder()
@@ -285,9 +397,16 @@ impl Decoder for ProRes {
 					.code(shaders::IDCT)
 					.build(),
 				None)?;
+			let spread_422 = vk.create_shader_module(
+				&vk::ShaderModuleCreateInfo::builder()
+					.code(shaders::SPREAD_422)
+					.build(),
+				None)?;
 
+			let memory_properties = context.instance()
+				.get_physical_device_memory_properties(*context.physical_device());
 
-			let frame_set_layout = vk.create_descriptor_set_layout(
+			let input_data_set_layout = vk.create_descriptor_set_layout(
 				&vk::DescriptorSetLayoutCreateInfo::builder()
 					.bindings(&[
 						vk::DescriptorSetLayoutBinding::builder()
@@ -304,7 +423,7 @@ impl Decoder for ProRes {
 					.build(),
 				None)?;
 
-			let image_set_layout = vk.create_descriptor_set_layout(
+			let working_data_set_layout = vk.create_descriptor_set_layout(
 				&vk::DescriptorSetLayoutCreateInfo::builder()
 					.bindings(&[
 						vk::DescriptorSetLayoutBinding::builder()
@@ -324,8 +443,8 @@ impl Decoder for ProRes {
 			let unpack_pipeline_layout = vk.create_pipeline_layout(
 				&vk::PipelineLayoutCreateInfo::builder()
 					.set_layouts(&[
-						frame_set_layout,
-						image_set_layout,
+						input_data_set_layout,
+						working_data_set_layout,
 					])
 					.build(),
 				None)?;
@@ -333,7 +452,16 @@ impl Decoder for ProRes {
 			let idct_pipeline_layout = vk.create_pipeline_layout(
 				&vk::PipelineLayoutCreateInfo::builder()
 					.set_layouts(&[
-						image_set_layout
+						working_data_set_layout
+					])
+					.build(),
+				None)?;
+
+			let spread_422_pipeline_layout = vk.create_pipeline_layout(
+				&vk::PipelineLayoutCreateInfo::builder()
+					.set_layouts(&[
+						working_data_set_layout,
+						context.frame_descriptor_set_layout()
 					])
 					.build(),
 				None)?;
@@ -356,31 +484,13 @@ impl Decoder for ProRes {
 				.map(|(i, _)| i)
 				.unwrap() as u32;
 
-			Ok(SharedState {
-				pipeline_cache,
-				queue_family_index,
-				unpack_pipeline_layout,
-				idct_pipeline_layout,
-				unpack_slices,
-				idct,
-				image_set_layout,
-				frame_set_layout
-			})
-		}
-	}
-
-	fn create_instance_state(
-		context: &DeviceContext,
-		shared: &Self::SharedState
-	) -> Result<Self::InstanceState, Self::Error> {
-		let endianness = endian::host_endianness()?;
-		let vk = context.device();
-		unsafe {
+			/* Create all of the pipelines. */
+			let endianness = endian::host_endianness()?;
 			let unpack_pipeline = macros::create_compute_pipeline! {
 				device: vk,
-				cache: shared.pipeline_cache,
-				layout: shared.unpack_pipeline_layout,
-				module: shared.unpack_slices,
+				cache: pipeline_cache,
+				layout: unpack_pipeline_layout,
+				module: unpack_slices,
 				entry: "main",
 				specialization: [
 					/* int cLittleEndian */
@@ -396,24 +506,46 @@ impl Decoder for ProRes {
 
 			let idct_pipeline = macros::create_compute_pipeline! {
 				device: vk,
-				cache: shared.pipeline_cache,
-				layout: shared.idct_pipeline_layout,
-				module: shared.idct,
+				cache: pipeline_cache,
+				layout: idct_pipeline_layout,
+				module: idct,
 				entry: "main",
 				specialization: []
 			}?;
 
-			let spread_pipeline = macros::create_compute_pipeline! {
+			let spread_422_pipeline = macros::create_compute_pipeline! {
 				device: vk,
-				cache: shared.pipeline_cache,
+				cache: pipeline_cache,
+				layout: spread_422_pipeline_layout,
+				module: spread_422,
+				entry: "main",
+				specialization: []
+			}?;
 
-			};
-
-			Ok(InstanceState {
+			Ok(SharedState {
+				pipeline_cache,
+				queue_family_index,
+				memory_properties,
+				unpack_pipeline_layout,
+				idct_pipeline_layout,
+				spread_422_pipeline_layout,
 				unpack_pipeline,
-				idct_pipeline
+				idct_pipeline,
+				spread_422_pipeline,
+				unpack_slices,
+				idct,
+				spread_422,
+				working_data_set_layout,
+				input_data_set_layout
 			})
 		}
+	}
+
+	fn create_instance_state(
+		_context: &DeviceContext,
+		_shared: &Self::SharedState
+	) -> Result<Self::InstanceState, Self::Error> {
+		Ok(())
 	}
 
 	fn create_worker_state(
@@ -429,12 +561,28 @@ impl Decoder for ProRes {
 					.build(),
 				None)?;
 
+			let descriptor_pool = vk.create_descriptor_pool(
+				&vk::DescriptorPoolCreateInfo::builder()
+					.flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+					.pool_sizes(&[
+						vk::DescriptorPoolSize::builder()
+							.ty(vk::DescriptorType::STORAGE_BUFFER)
+							.descriptor_count(Self::MAX_WORKER_STORAGE_BUFFER_DESCRIPTORS)
+							.build(),
+						vk::DescriptorPoolSize::builder()
+							.ty(vk::DescriptorType::STORAGE_IMAGE)
+							.descriptor_count(Self::MAX_WORKER_STORAGE_IMAGE_DESCRIPTORS)
+							.build()
+					])
+					.max_sets(Self::MAX_WORKER_DESCRIPTOR_SETS), None)?;
+
 			let mut state = WorkerState {
-				command_buffer_pool,
-				descriptor_set_pool: Default::default(),
-				command_buffer_recycling_queue: Default::default(),
-				image_descriptor_set_recycling_queue: Default::default(),
-				frame_descriptor_set_recycling_queue: Default::default(),
+				command_pool: command_buffer_pool,
+				descriptor_pool,
+				leaked_command_buffers: 0,
+				progressive_422_command_buffer: None,
+				upload_memory: None,
+				on_device_memory: None,
 			};
 			let _ = state.new_descriptor_pool(context)?;
 			Ok(state)
@@ -442,95 +590,41 @@ impl Decoder for ProRes {
 	}
 
 	fn create_frame_state(
-		context: &DeviceContext,
-		shared: &Self::SharedState,
-		instance: &Self::InstanceState,
-		worker: &mut Self::WorkerState,
-		image: &ImageView
+		_context: &DeviceContext,
+		_shared: &Self::SharedState,
+		_instance: &Self::InstanceState,
+		_worker: &mut Self::WorkerState,
+		_image: &ImageView
 	) -> Result<Self::FrameState, Self::Error> {
-
-		let vk = context.device();
-		unsafe {
-			let frame_bind = worker.get_frame_descriptor_set(context, shared)?;
-			let image_bind = worker.get_image_descriptor_set(context, shared)?;
-
-			vk.update_descriptor_sets(
-				&[
-					vk::WriteDescriptorSet::builder()
-						.dst_set(image_bind)
-						.dst_binding(0)
-						.dst_array_element(0)
-						.descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-						.image_info(&[
-							vk::DescriptorImageInfo::builder()
-								.image_layout(vk::ImageLayout::GENERAL)
-								.image_view()
-								.build(),
-							vk::DescriptorImageInfo::builder()
-								.image_layout(vk::ImageLayout::GENERAL)
-								.image_view(image.raw_handle())
-								.build()
-						])
-						.build()
-				],
-				&[])?;
-
-			let commands = worker.get_command_buffer(context)?;
-			vk.reset_command_buffer(
-				commands,
-				vk::CommandBufferResetFlags::empty())?;
-
-			vk.cmd_bind_pipeline(
-				commands,
-				vk::PipelineBindPoint::COMPUTE,
-				instance.unpack_pipeline);
-
-			vk.cmd_bind_descriptor_sets(
-				commands,
-				vk::PipelineBindPoint::COMPUTE,
-				shared.unpack_pipeline_layout,
-				0,
-				&[frame_bind],
-				&[0]);
-
-			vk.cmd_dispatch()
-
-
-			Ok(FrameState {
-				frame_bind,
-				image_bind,
-				commands,
-			})
-		}
+		Ok(())
 	}
 
 	fn destroy_shared_state(
 		context: &DeviceContext,
 		shared: &mut Self::SharedState
 	) {
-		let vk = &context.device;
+		let vk = context.device();
 		unsafe {
 			vk.destroy_pipeline_cache(shared.pipeline_cache, None);
+			vk.destroy_pipeline(shared.unpack_pipeline, None);
+			vk.destroy_pipeline(shared.idct_pipeline, None);
+			vk.destroy_pipeline(shared.spread_422_pipeline, None);
 			vk.destroy_shader_module(shared.unpack_slices, None);
 			vk.destroy_shader_module(shared.idct, None);
+			vk.destroy_shader_module(shared.spread_422, None);
 			vk.destroy_pipeline_layout(shared.unpack_pipeline_layout, None);
 			vk.destroy_pipeline_layout(shared.idct_pipeline_layout, None);
-			vk.destroy_descriptor_set_layout(shared.image_set_layout, None);
-			vk.destroy_descriptor_set_layout(shared.frame_set_layout, None);
+			vk.destroy_pipeline_layout(shared.spread_422_pipeline_layout, None);
+			vk.destroy_descriptor_set_layout(shared.working_data_set_layout, None);
+			vk.destroy_descriptor_set_layout(shared.input_data_set_layout, None);
 		}
 	}
 
 	fn destroy_instance_state(
-		context: &DeviceContext,
+		_context: &DeviceContext,
 		_shared: &Self::SharedState,
-		instance: &mut Self::InstanceState
-	) {
-		let vk = context.device();
-		unsafe {
-			vk.destroy_pipeline(instance.unpack_pipeline, None);
-			vk.destroy_pipeline(instance.idct_pipeline, None);
-		}
-	}
+		_instance: &mut Self::InstanceState
+	) {}
 
 	fn destroy_worker_state(
 		context: &DeviceContext,
@@ -540,50 +634,42 @@ impl Decoder for ProRes {
 	) {
 		let vk = context.device();
 		unsafe {
-			vk.destroy_command_pool(worker.command_buffer_pool, None);
-			for i in worker.descriptor_set_pool {
+			vk.destroy_command_pool(worker.command_pool, None);
+			for i in worker.descriptor_pool {
 				vk.destroy_descriptor_pool(i, None);
 			}
 		}
 	}
 
 	fn destroy_frame_state(
-		context: &DeviceContext,
-		shared: &Self::SharedState,
-		instance: &Self::InstanceState,
-		worker: &mut Self::WorkerState,
-		frame: &mut Self::FrameState
-	) {
-		todo!()
-	}
+		_context: &DeviceContext,
+		_shared: &Self::SharedState,
+		_instance: &Self::InstanceState,
+		_worker: &mut Self::WorkerState,
+		_frame: &mut Self::FrameState
+	) {}
 }
 
 pub struct SharedState {
 	pipeline_cache: vk::PipelineCache,
 	queue_family_index: u32,
 
+	memory_properties: vk::PhysicalDeviceMemoryProperties,
+
 	unpack_pipeline_layout: vk::PipelineLayout,
 	idct_pipeline_layout: vk::PipelineLayout,
-	spread_pipeline_layout: vk::PipelineLayout,
-
-	unpack_slices: vk::ShaderModule,
-	idct: vk::ShaderModule,
-	spread: vk::ShaderModule,
-
-	image_set_layout: vk::DescriptorSetLayout,
-	frame_set_layout: vk::DescriptorSetLayout,
-}
-
-pub struct InstanceState {
-	decoder_state: DecoderState,
+	spread_422_pipeline_layout: vk::PipelineLayout,
 
 	unpack_pipeline: vk::Pipeline,
 	idct_pipeline: vk::Pipeline,
-	spread_pipeline: vk::Pipeline,
-}
+	spread_422_pipeline: vk::Pipeline,
 
-enum DecoderState {
+	unpack_slices: vk::ShaderModule,
+	idct: vk::ShaderModule,
+	spread_422: vk::ShaderModule,
 
+	working_data_set_layout: vk::DescriptorSetLayout,
+	input_data_set_layout: vk::DescriptorSetLayout,
 }
 
 struct UploadMemory {
@@ -595,29 +681,500 @@ struct UploadMemory {
 	picture_data_buffer_size: vk::DeviceSize,
 	picture_data_buffer: vk::Buffer,
 
+	descriptor_set: vk::DescriptorSet,
+
 	allocation_size: vk::DeviceSize,
 	allocation: vk::DeviceMemory,
 	map: NonNull<u8>
 }
 
 struct OnDeviceMemory {
-	allocation_size: usize,
+	coefficient_image_extent: vk::Extent2D,
+	coefficient_image: vk::Image,
+
+	component_image_extent: vk::Extent2D,
+	component_image: vk::Image,
+
+	descriptor_set: vk::DescriptorSet,
+
+	allocation_size: vk::DeviceSize,
 	allocation: vk::DeviceMemory,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum SubsamplingFormat {
+	Subsampling444,
+	Subsampling422
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ScanBehavior {
+	Progressive,
+	InterlacedFirstPicture,
+	InterlacedSecondPicture,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct FrameLayout {
+	/// Number of macroblocks in the horizontal direction.
+	mb_width: u16,
+	/// Number of macroblocks in the vertical direction.
+	mb_height: u16,
+	/// Number of slices in every row of macroblocks.
+	slice_count_per_row: u16,
+}
+
 struct WorkerState {
-	command_buffer_pool: vk::CommandPool,
-	descriptor_set_pool: LinkedList<vk::DescriptorPool>,
-	command_buffer_recycling_queue: VecDeque<vk::CommandBuffer>,
-	image_descriptor_set_recycling_queue: VecDeque<vk::DescriptorSet>,
-	frame_descriptor_set_recycling_queue: VecDeque<vk::DescriptorSet>,
+	command_pool: vk::CommandPool,
+	descriptor_pool: vk::DescriptorPool,
+
+	leaked_command_buffers: u8,
+	progressive_422_command_buffer: Option<(FrameLayout, vk::CommandBuffer)>,
 
 	upload_memory: Option<UploadMemory>,
 	on_device_memory: Option<OnDeviceMemory>,
 }
 impl WorkerState {
+	/// The maximum number of command buffers we are allowed to leak before an invalidation is
+	/// forced to happen.
+	const MAX_LEAKED_COMMAND_BUFFERS: u8 = 8;
+
 	pub fn upload_memory(&self) -> &UploadMemory {
 		self.upload_memory.as_ref().unwrap()
+	}
+
+	/// Signals that all command buffers that were previously recorded can't be used again and must
+	/// be recreated.
+	///
+	/// This will often be necessary as a result of the scheduler and decoder dispatch procedures
+	/// recreating resources to fit new constraints or because things were moved around in memory.
+	/// Because the command buffers we have after the creation of the new resources still reference
+	/// the old ones, we can't use them, and so we have to make sure we discard them properly.
+	///
+	pub fn invalidate_command_buffers(
+		&mut self,
+		context: &DeviceContext
+	) -> Result<(), Error> {
+		self.progressive_422_command_buffer = None;
+		unsafe {
+			context.device().reset_command_pool(
+				self.command_pool,
+				vk::CommandPoolResetFlags::RELEASE_RESOURCES
+			)
+		}?;
+		self.leaked_command_buffers = 0;
+		Ok(())
+	}
+
+	/// On some occasions a command buffer may be leaked. This function helps us keep track of that
+	/// and forces the command buffers to be invalidated if we end up leaking too many in between
+	/// calls to [`Self::invalidate_command_buffers`].
+	fn signal_leaked_command_buffer(
+		&mut self,
+		context: &DeviceContext,
+	) -> Result<(), Error> {
+		self.leaked_command_buffers += 1;
+		if self.leaked_command_buffers > Self::MAX_LEAKED_COMMAND_BUFFERS {
+			self.invalidate_command_buffers(context)
+		} else {
+			Ok(())
+		}
+	}
+
+	/// Acquires a previously recorded buffer or allocates a new one if not available.
+	pub unsafe fn command_buffer(
+		&mut self,
+		context: &DeviceContext,
+		shared: &SharedState,
+		frame: &Frame<<ProRes as Decoder>::FrameState>,
+		frame_layout: FrameLayout,
+		scan_behavior: ScanBehavior,
+		subsampling_format: SubsamplingFormat
+	) -> Result<vk::CommandBuffer, Error> {
+		let command_pool = self.command_pool;
+		let record_new_buffer = || unsafe {
+			let buffer = context.device().allocate_command_buffers(
+				&vk::CommandBufferAllocateInfo::builder()
+					.command_pool(command_pool)
+					.level(vk::CommandBufferLevel::PRIMARY)
+					.command_buffer_count(1)
+					.build())?[0];
+
+			context.device().begin_command_buffer(
+				buffer,
+				&vk::CommandBufferBeginInfo::builder()
+					.build())?;
+
+			self.record_commands(
+				context,
+				shared,
+				frame,
+				buffer,
+				scan_behavior,
+				subsampling_format,
+				frame_layout)?;
+
+			context.device().end_command_buffer(buffer)?;
+
+			buffer
+		};
+		macro_rules! update_command_buffer {
+			($target:expr) => {{
+				if $target.is_some() { self.signal_leaked_command_buffer(context) }
+				$target.replace((frame_layout, record_new_buffer()))
+			}}
+		}
+
+		match (scan_behavior, subsampling_format) {
+			(ScanBehavior::Progressive, SubsamplingFormat::Subsampling422) => match &mut self.progressive_422_command_buffer {
+				Some((tentative_frame_layout, buffer))
+					if tentative_frame_layout == frame_layout => Ok(*buffer),
+				 old => update_command_buffer!(old)
+			},
+			_ => unimplemented!()
+		}
+	}
+
+	/// Records the commands for a given configuration on a given command buffer. The buffer must be
+	/// put in recording mode before it is passed to this function.
+	unsafe fn record_commands(
+		&self,
+		context: &DeviceContext,
+		shared: &SharedState,
+		frame: &Frame<<ProRes as Decoder>::FrameState>,
+		buffer: vk::CommandBuffer,
+		scan: ScanBehavior,
+		subsampling: SubsamplingFormat,
+		frame_layout: FrameLayout,
+	) -> Result<(), Error> {
+		if subsampling != SubsamplingFormat::Subsampling422 || scan != ScanBehavior::Progressive {
+			unimplemented!()
+		}
+
+		let FrameLayout { mb_width, mb_height, slice_count_per_row: slices_per_mb_row } = frame_layout;
+		let slice_count = u32::from(slices_per_mb_row) * u32::from(mb_height);
+
+		let on_device_memory = self.on_device_memory.as_ref().unwrap();
+		let upload_memory = self.upload_memory.as_ref().unwrap();
+
+		let dev = context.device();
+		dev.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::COMPUTE, shared.unpack_pipeline);
+		dev.cmd_bind_descriptor_sets(
+			buffer,
+			vk::PipelineBindPoint::COMPUTE,
+			shared.unpack_pipeline_layout,
+			0,
+			&[
+				upload_memory.descriptor_set,
+				on_device_memory.descriptor_set
+			],
+			&[0, 0]);
+		dev.cmd_pipeline_barrier(
+			buffer,
+			vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::TOP_OF_PIPE,
+			vk::PipelineStageFlags::COMPUTE_SHADER,
+			vk::DependencyFlags::empty(),
+			&[],
+			&[
+				/* When we're uploading frame data to the device, the code is laid out such that our
+				 * last call to vkFlushMappedMemoryRanges happens before we submit this command
+				 * buffer is submitted via vkQueueSubmit. Because of that, all of those writes have
+				 * already been made visible to all agents and references on the device[1] by the
+				 * time this command buffer starts executing, and so there's no need to explicitly
+				 * include the memory dependency on host writes here.
+				 *
+				 * So we don't have to put any barriers here.
+				 *
+				 * [1]: https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#memory-model-vulkan-availability-visibility */
+			],
+			&[
+				vk::ImageMemoryBarrier::builder()
+					.dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+					.image(on_device_memory.coefficient_image)
+					.old_layout(vk::ImageLayout::UNDEFINED)
+					.new_layout(vk::ImageLayout::GENERAL)
+					.subresource_range(
+						vk::ImageSubresourceRange::builder()
+							.aspect_mask(vk::ImageAspectFlags::COLOR)
+							.base_array_layer(0)
+							.base_mip_level(0)
+							.layer_count(1)
+							.level_count(1)
+							.build())
+					.build(),
+				vk::ImageMemoryBarrier::builder()
+					.dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+					.image(on_device_memory.component_image)
+					.old_layout(vk::ImageLayout::UNDEFINED)
+					.new_layout(vk::ImageLayout::GENERAL)
+					.subresource_range(
+						vk::ImageSubresourceRange::builder()
+							.aspect_mask(vk::ImageAspectFlags::COLOR)
+							.base_array_layer(0)
+							.base_mip_level(0)
+							.layer_count(1)
+							.level_count(1)
+							.build())
+					.build(),
+			]);
+
+		dev.cmd_dispatch(buffer, slice_count, 1, 1);
+		dev.cmd_pipeline_barrier(
+			buffer,
+			vk::PipelineStageFlags::COMPUTE_SHADER,
+			vk::PipelineStageFlags::COMPUTE_SHADER,
+			vk::DependencyFlags::empty(),
+			&[
+				vk::MemoryBarrier::builder()
+					.src_access_mask(vk::AccessFlags::SHADER_WRITE)
+					.dst_access_mask(vk::AccessFlags::SHADER_READ)
+					.build()
+			],
+			&[],
+			&[]);
+
+		dev.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::COMPUTE, shared.idct_pipeline);
+		dev.cmd_bind_descriptor_sets(
+			buffer,
+			vk::PipelineBindPoint::COMPUTE,
+			shared.idct_pipeline_layout,
+			0,
+			&[
+				on_device_memory.descriptor_set
+			],
+			&[0]);
+		dev.cmd_dispatch(
+			buffer,
+			u32::from(mb_width) * 16,
+			u32::from(mb_height) * 16,
+			1
+		);
+		dev.cmd_pipeline_barrier(
+			buffer,
+			vk::PipelineStageFlags::COMPUTE_SHADER,
+			vk::PipelineStageFlags::COMPUTE_SHADER,
+			vk::DependencyFlags::empty(),
+			&[
+				vk::MemoryBarrier::builder()
+					.src_access_mask(vk::AccessFlags::SHADER_WRITE)
+					.dst_access_mask(vk::AccessFlags::SHADER_READ)
+					.build()
+			],
+			&[],
+			&[]);
+
+		dev.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::COMPUTE, shared.idct_pipeline);
+		dev.cmd_bind_descriptor_sets(
+			buffer,
+			vk::PipelineBindPoint::COMPUTE,
+			shared.idct_pipeline_layout,
+			0,
+			&[
+				on_device_memory.descriptor_set
+			],
+			&[0]);
+		dev.cmd_dispatch(
+			buffer,
+			u32::from(mb_width) * 16,
+			u32::from(mb_height) * 16,
+			1
+		);
+
+		dev.cmd_bind_pipeline(buffer, vk::PipelineBindPoint::COMPUTE, shared.spread_422_pipeline);
+		dev.cmd_bind_descriptor_sets(
+			buffer,
+			vk::PipelineBindPoint::COMPUTE,
+			shared.spread_422_pipeline_layout,
+			0,
+			&[
+				on_device_memory.descriptor_set,
+				frame.descriptor_set(),
+			],
+			&[0, 0]);
+		dev.cmd_dispatch(
+			buffer,
+			u32::from(mb_width) * 8,
+			u32::from(mb_height) * 16,
+			1
+		);
+
+		Ok(())
+	}
+
+	/// Pick the memory type with the largest heap that fits the given constraints.
+	fn pick_memory(
+		shared: &SharedState,
+		mask: u32,
+		type_requirements: vk::MemoryPropertyFlags,
+		heap_requirements: vk::MemoryHeapFlags,
+	) -> Option<u32> {
+		let mut candidates = 0u32;
+		for i in 0..shared.memory_properties.memory_type_count {
+			let memory_type = shared.memory_properties.memory_types[i as usize];
+			let memory_heap = shared.memory_properties.memory_heaps[memory_type.heap_index as usize];
+
+			let bit = 1u32 << i;
+			if bit & mask == 0 { continue }
+
+			let a = memory_type.property_flags.contains(type_requirements);
+			let b = memory_heap.flags.contains(heap_requirements);
+			if !a || !b { continue }
+
+			candidates |= bit;
+		}
+
+		let mut chosen_type = None;
+		for i in 0..u32::BITS {
+			let is_candidate = (candidates >> i) & 1 != 0;
+			if !is_candidate { continue }
+
+			let memory_type = shared.memory_properties
+				.memory_types[i as usize];
+			let memory_heap = shared.memory_properties
+				.memory_heaps[memory_type.heap_index as usize];
+
+			if let Some(chosen_type) = chosen_type {
+				let chosen_memory_type = shared.memory_properties
+					.memory_types[chosen_type as usize];
+				let chosen_memory_heap = shared.memory_properties
+					.memory_heaps[chosen_memory_type.heap_index as usize];
+
+				if chosen_memory_heap.size >= memory_heap.size {
+					continue
+				}
+			}
+
+			chosen_type = Some(i)
+		}
+
+		chosen_type
+	}
+
+	/// Reports whether the current images are large enough for the given data.
+	pub fn on_device_memory_large_enough(
+		&self,
+		coefficient_image_extent: vk::Extent2D,
+		component_image_extent: vk::Extent2D,
+	) -> bool {
+		self.on_device_memory.as_ref()
+			.map(|on_device_memory|
+				   on_device_memory.coefficient_image_extent.width >= coefficient_image_extent.width
+				&& on_device_memory.coefficient_image_extent.height >= coefficient_image_extent.height
+				&& on_device_memory.component_image_extent.width >= component_image_extent.width
+				&& on_device_memory.component_image_extent.height >= component_image_extent.height)
+			.unwrap_or(true)
+	}
+
+	/// Reallocates the on device memory allocation and sets up new buffers for it.
+	pub unsafe fn realloc_on_device_memory(
+		&mut self,
+		context: &DeviceContext,
+		shared: &SharedState,
+		coefficient_image_extent: vk::Extent2D,
+		component_image_extent: vk::Extent2D,
+	) {
+		let props = context.instance().get_physical_device_image_format_properties(
+			*context.physical_device(),
+			vk::Format::R32G32B32A32_SFLOAT,
+			vk::ImageType::TYPE_2D,
+			vk::ImageTiling::OPTIMAL,
+			vk::ImageUsageFlags::STORAGE,
+			vk::ImageCreateFlags::default())
+			.unwrap();
+
+		let extent_valid = |extent|
+			   props.max_extent.width >= extent.width
+			&& props.max_extent.height >= extent.height
+			&& props.max_extent.depth >= 1;
+		if !extent_valid(coefficient_image_extent) || !extent_valid(component_image_extent) {
+			panic!("extent too large")
+		}
+
+		let build_image = |size| context.device()
+			.create_image(&vk::ImageCreateInfo::builder()
+				.usage(vk::ImageUsageFlags::STORAGE)
+				.image_type(vk::ImageType::TYPE_2D)
+				.format(vk::Format::R32G32B32A32_SFLOAT)
+				.mip_levels(1)
+				.extent(vk::Extent3D {
+					width: size.width,
+					height: size.height,
+					depth: 1,
+				})
+				.build(), None)
+			.unwrap();
+
+		let coefficient_image = build_image(coefficient_image_extent);
+		let component_image = build_image(component_image_extent);
+
+		let coefficient_image_memreq = context.device().get_image_memory_requirements(coefficient_image);
+		let component_image_memreq = context.device().get_image_memory_requirements(component_image);
+		let padding0 =
+			(component_image_memreq.alignment - coefficient_image_memreq.size % component_image_memreq.alignment)
+				% component_image_memreq.alignment;
+
+		let total_size =
+			coefficient_image_memreq.size
+				.checked_add(component_image_memreq.size)
+				.unwrap()
+				.checked_add(padding0)
+				.unwrap();
+
+		let requires_new_allocation = self.on_device_memory
+			.as_ref()
+			.map(|on_device_memory| on_device_memory.allocation_size < total_size)
+			.unwrap_or(true);
+
+		let (allocation, allocation_size) = if requires_new_allocation {
+			let memory_type_index = Self::pick_memory(
+				shared,
+				coefficient_image_memreq.memory_type_bits & component_image_memreq.memory_type_bits,
+				vk::MemoryPropertyFlags::DEVICE_LOCAL,
+				vk::MemoryHeapFlags::DEVICE_LOCAL)
+				.unwrap();
+
+			(context.allocate_memory(&vk::MemoryAllocateInfo::builder()
+				.allocation_size(total_size)
+				.memory_type_index(memory_type_index)
+				.build())
+				.unwrap()
+				.unwrap(), total_size)
+		} else {
+			(
+				self.on_device_memory.as_ref().unwrap().allocation,
+				self.on_device_memory.as_ref().unwrap().allocation_size
+			)
+		};
+
+		if let Some(on_device_memory) = self.on_device_memory.take() {
+			context.device().destroy_image(on_device_memory.coefficient_image, None);
+			context.device().destroy_image(on_device_memory.component_image, None);
+
+			if requires_new_allocation {
+				context.free_memory(on_device_memory.allocation);
+			}
+		}
+
+		context.device().bind_image_memory(
+			coefficient_image,
+			allocation,
+			0
+		).unwrap();
+
+		context.device().bind_image_memory(
+			component_image,
+			allocation,
+			coefficient_image_memreq.size + padding0
+		).unwrap();
+
+		self.on_device_memory = Some(OnDeviceMemory {
+			coefficient_image_extent,
+			coefficient_image,
+			component_image_extent,
+			component_image,
+			allocation_size,
+			allocation,
+		});
 	}
 
 	/// Reports whether the current buffers are large enough for the given data.
@@ -656,7 +1213,9 @@ impl WorkerState {
 
 		let index_memreq = context.device().get_buffer_memory_requirements(index_buffer);
 		let picture_data_memreq = context.device().get_buffer_memory_requirements(picture_data_buffer);
-		let padding0 = picture_data_memreq.alignment - index_memreq.size % picture_data_memreq.alignment;
+		let padding0 =
+			(picture_data_memreq.alignment - index_memreq.size % picture_data_memreq.alignment)
+				% picture_data_memreq.alignment;
 
 		let total_size =
 			index_memreq.size
@@ -670,15 +1229,47 @@ impl WorkerState {
 			.map(|upload_memory| upload_memory.allocation_size < total_size)
 			.unwrap_or(true);
 
-		let allocation = if requires_new_allocation {
-			context.allocate_memory(&vk::MemoryAllocateInfo::builder()
+		let (allocation, allocation_size) = if requires_new_allocation {
+			let memory_type_index = Self::pick_memory(
+				shared,
+				index_memreq.memory_type_bits & picture_data_memreq.memory_type_bits,
+				vk::MemoryPropertyFlags::HOST_VISIBLE,
+				vk::MemoryHeapFlags::default())
+				.unwrap();
+
+			(context.allocate_memory(&vk::MemoryAllocateInfo::builder()
 				.allocation_size(total_size)
-				.memory_type_index(shared.upload_memory_type)
+				.memory_type_index(memory_type_index)
 				.build())
 				.unwrap()
-				.unwrap()
+				.unwrap(), total_size)
 		} else {
-			self.upload_memory.as_ref().unwrap().allocation
+			(
+				self.upload_memory.as_ref().unwrap().allocation,
+				self.upload_memory.as_ref().unwrap().allocation_size,
+			)
+		};
+
+		let map_new_allocation = ||
+			NonNull::new(context.device().map_memory(
+				allocation,
+				0,
+				total_size,
+				vk::MemoryMapFlags::empty())
+				.unwrap() as *mut u8)
+				.unwrap();
+
+		let map = match self.upload_memory.take() {
+			Some(upload_memory) => {
+				context.device().destroy_buffer(upload_memory.index_buffer, None);
+				context.device().destroy_buffer(upload_memory.picture_data_buffer, None);
+
+				if requires_new_allocation {
+					context.free_memory(upload_memory.allocation);
+					map_new_allocation()
+				} else { upload_memory.map }
+			},
+			None => map_new_allocation()
 		};
 
 		context.device().bind_buffer_memory(
@@ -693,19 +1284,6 @@ impl WorkerState {
 			index_memreq.size + padding0
 		).unwrap();
 
-		let (mapped_length, map) = match self.upload_memory.take() {
-			Some(upload_memory) => {
-				context.device().destroy_buffer(upload_memory.index_buffer, None);
-				context.device().destroy_buffer(upload_memory.picture_data_buffer, None);
-
-				if requires_new_allocation {
-					context.free_memory(upload_memory.allocation);
-					(0, None)
-				} else { (upload_memory.mapped_length, upload_memory.map) }
-			},
-			None => (0, None)
-		};
-
 		self.upload_memory = Some(UploadMemory {
 			index_buffer_offset: 0,
 			index_buffer_size: index_memreq.size,
@@ -713,9 +1291,8 @@ impl WorkerState {
 			picture_data_buffer_offset: index_memreq.size + padding0,
 			picture_data_buffer_size: picture_data_memreq.size,
 			picture_data_buffer,
-			allocation_size: total_size,
+			allocation_size,
 			allocation,
-			mapped_length,
 			map,
 		});
 	}
@@ -735,88 +1312,12 @@ impl WorkerState {
 		} else {
 			let buffers = vk.allocate_command_buffers(
 				&vk::CommandBufferAllocateInfo::builder()
-					.command_pool(self.command_buffer_pool)
+					.command_pool(self.command_pool)
 					.command_buffer_count(1)
 					.build())?;
 			Ok(buffers[0])
 		}
 	}
-
-	unsafe fn new_descriptor_pool(
-		&mut self,
-		context: &DeviceContext
-	) -> VkResult<vk::DescriptorPool> {
-
-		/// Maximum number of instances that will fit in a single pool.
-		///
-		/// TODO: Having a fixed number of instances per descriptor pool is wasteful.
-		const INSTANCES: u32 = 64;
-
-		let vk = context.device();
-		let pool = unsafe {
-			vk.create_descriptor_pool(
-				&vk::DescriptorPoolCreateInfo::builder()
-					.max_sets(INSTANCES * 2)
-					.pool_sizes(&[
-						vk::DescriptorPoolSize::builder()
-							.ty(vk::DescriptorType::STORAGE_BUFFER)
-							.descriptor_count(INSTANCES * 2)
-							.build(),
-						vk::DescriptorPoolSize::builder()
-							.ty(vk::DescriptorType::STORAGE_IMAGE)
-							.descriptor_count(INSTANCES * 2)
-							.build(),
-					])
-					.build(),
-				None)?
-		};
-		self.descriptor_set_pool.push_back(pool);
-		Ok(pool)
-	}
-
-	pub unsafe fn allocate_descriptor_set(
-		&mut self,
-		context: &DeviceContext,
-		layout: vk::DescriptorSetLayout,
-	) -> VkResult<vk::DescriptorSet> {
-		let vk = context.device();
-		let attempt = |pool| unsafe {
-			vk.allocate_descriptor_sets(
-				&vk::DescriptorSetAllocateInfo::builder()
-					.descriptor_pool(pool)
-					.set_layouts(&[layout])
-					.build())
-		};
-
-		match attempt(*self.descriptor_set_pool.back().unwrap()) {
-			Ok(sets) => Ok(sets[0]),
-			Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY)
-			| Err(vk::Result::ERROR_FRAGMENTED_POOL) =>
-				Ok(attempt(self.new_descriptor_pool(context)?)?[0])
-		}
-	}
-
-	macros::instance_descriptor_set_functions! {
-		pub unsafe (
-			#[doc = "Returns a new image descriptor set."]
-			fn get_image_descriptor_set,
-			#[doc = "Recycles an old image descriptor set that's no longer in use."]
-			fn ret_image_descriptor_set
-		) => image_descriptor_set_recycling_queue;
-		pub unsafe (
-			#[doc = "Returns a new frame descriptor set for."]
-			fn get_frame_descriptor_set,
-			#[doc = "Recycles an old frame descriptor set that's no longer in use."]
-			fn ret_frame_descriptor_set
-		) => frame_descriptor_set_recycling_queue;
-	}
-}
-
-pub struct FrameState {
-	frame_bind: vk::DescriptorSet,
-	image_bind: vk::DescriptorSet,
-	commands: vk::CommandBuffer,
-
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -847,4 +1348,7 @@ mod shaders {
 
 	#[sshdr::include(file = "../../../shaders/prores/IDCT.glsl", stage = "compute")]
 	pub static IDCT: &'static [u32];
+
+	#[sshdr::include(file = "../../../shaders/prores/Spread422.glsl", stage = "compute")]
+	pub static SPREAD_422: &'static [u32];
 }

@@ -12,7 +12,6 @@ use crate::Decoder;
 /// The internal shared context any given instance is reliant on.
 pub(crate) struct VprContext {
 	pub entry: ash::Entry,
-	pub instance: ash::Instance,
 	pub device: VprDeviceContext
 }
 
@@ -64,11 +63,22 @@ impl VprDeviceContext {
 /// It is the structure providing codecs with the ability to directly call into
 /// Vulkan procedures and to manage Vulkan-related resources.
 pub struct DeviceContext {
+	instance: ash::Instance,
 	physical_device: vk::PhysicalDevice,
 	physical_device_properties: vk::PhysicalDeviceProperties,
 	physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
 	queue_family_properties: Vec<vk::QueueFamilyProperties>,
 	device: ash::Device,
+
+	/// The layout describing the descriptor set that can be obtained by calling
+	/// [`Frame::descriptor_set`].
+	///
+	/// This is fixed for the lifetime of the instance and bound to it, so it makes sense to put it
+	/// here. Additionally, putting it here lets decoders and encoders access this value as soon as
+	/// possible.
+	///
+	/// [`Frame::descriptor_set`]: crate::image::Frame::descriptor_set
+	frame_descriptor_set_layout: vk::DescriptorSetLayout,
 
 	/// We use this to keep track of the allocations we've made.
 	///
@@ -77,20 +87,43 @@ pub struct DeviceContext {
 	allocation_count: AtomicU32,
 }
 impl DeviceContext {
+	/// Returns a handle to the Vulkan instance. Additionally, this handle provides access to
+	/// instance methods.
+	pub fn instance(&self) -> &ash::Instance {
+		&self.instance
+	}
+
+	/// Returns a reference to the physical device this context is bound to.
 	pub fn physical_device(&self) -> &vk::PhysicalDevice {
 		&self.physical_device
 	}
+
+	/// Returns the general properties of this context's physical device.
 	pub fn physical_device_properties(&self) -> &vk::PhysicalDeviceProperties {
 		&self.physical_device_properties
 	}
+
+	/// Returns the memory layout of this context's physical device.
+	pub fn physical_device_memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+		&self.physical_device_memory_properties
+	}
+
+	/// Returns a handle to the logical device this context is bound to. Additionally, this handle
+	/// provides access to logical device methods.
 	pub fn device(&self) -> &ash::Device {
 		&self.device
 	}
+
+	/// Returns the list of queue families in this device.
 	pub fn queue_family_properties(&self) -> &[vk::QueueFamilyProperties] {
 		&self.queue_family_properties
 	}
-	pub fn physical_device_memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
-		&self.physical_device_memory_properties
+
+	/// Returns the descriptor set layout that describes the resources available in a [`Frame`].
+	///
+	/// [`Frame`]: crate::image::Frame
+	pub fn frame_descriptor_set_layout(&self) -> &vk::DescriptorSetLayout {
+
 	}
 
 	/// Tries to allocate memory on the device, failing if the maximum number of allocations would

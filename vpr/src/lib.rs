@@ -1,4 +1,5 @@
 #![feature(split_array)]
+#![feature(core_intrinsics)]
 //! Vulkan ProRes
 //!
 //! This crate provides an interface to
@@ -11,7 +12,6 @@ mod context;
 
 pub use context::*;
 
-pub use prores::*;
 pub use decoder::*;
 pub use error::*;
 

@@ -1,7 +1,7 @@
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use crate::{Context, DeviceContext, Dimensions, Error};
+use crate::{DeviceContext, Dimensions, Error};
 use crate::context::VprContext;
 use crate::image::{Frame, ImageView};
 
@@ -33,9 +33,9 @@ pub trait Decoder {
 	/// State data local to one decoder instance of a decoder type.
 	type InstanceState;
 	/// State data associated with each worker of the decoder.
-	type WorkerState: ?Send + ?Sync;
+	type WorkerState;
 	/// State data associated with each frame of the decoder.
-	type FrameState: ?Send + ?Sync;
+	type FrameState;
 	/// Parameters passed by the scheduler function to the decoder function.
 	type FrameParam;
 	/// Error type used by this decoder.
@@ -58,7 +58,7 @@ pub trait Decoder {
 		worker: &mut Self::WorkerState,
 		frame: &mut Frame<Self::FrameState>,
 		param: Self::FrameParam,
-		data: &[u8]);
+		data: &[u8]) -> Result<(), Self::Error>;
 
 	fn create_shared_state(
 		context: &DeviceContext) -> Result<Self::SharedState, Self::Error>;
@@ -119,14 +119,14 @@ impl<C> DecodeQueue<C> {
 }
 
 /// The scheduler for frame decode operations.
-pub struct DecodeScheduler<'a, C>
+pub struct DecodeScheduler<'a, C: ?Sized>
 	where C: Decoder {
 
 	source: &'a [u8],
 	frames: Vec<(&'a [u8], Dimensions, C::FrameParam)>,
 	_bind: std::marker::PhantomData<C>,
 }
-impl<'a, C> DecodeScheduler<'a, C>
+impl<'a, C: ?Sized> DecodeScheduler<'a, C>
 	where C: Decoder {
 
 	/// Schedule a new frame with the data covering the given range and parameter.
