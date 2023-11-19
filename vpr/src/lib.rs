@@ -9,6 +9,7 @@ mod prores;
 mod decoder;
 mod image;
 mod context;
+mod util;
 
 pub use context::*;
 

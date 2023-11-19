@@ -1,5 +1,9 @@
+mod queue;
+pub use queue::*;
+
 use std::ops::RangeBounds;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use crate::{DeviceContext, Dimensions, Error};
 use crate::context::VprContext;
@@ -94,28 +98,6 @@ pub trait Decoder {
 		instance: &Self::InstanceState,
 		worker: &mut Self::WorkerState,
 		frame: &mut Self::FrameState);
-}
-
-/// The decode queue.
-///
-/// This is the main structure through which decoding is actually performed and
-/// decoding operations are set up.
-pub struct DecodeQueue<C> {
-	context: Arc<VprContext>,
-	decoder: C,
-	incoming_data_buffer: Vec<u8>,
-}
-impl<C> DecodeQueue<C> {
-	pub(crate) fn new(
-		context: Arc<VprContext>,
-		decoder: C) -> Result<Self, Error> {
-
-		Ok(Self {
-			context,
-			decoder,
-			incoming_data_buffer: vec![]
-		})
-	}
 }
 
 /// The scheduler for frame decode operations.

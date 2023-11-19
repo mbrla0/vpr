@@ -1,14 +1,12 @@
-use std::collections::linked_list::LinkedList;
-use std::collections::vec_deque::VecDeque;
 use std::intrinsics::unlikely;
 use std::ptr::NonNull;
-use ash::prelude::VkResult;
 use crate::decoder::Decoder;
 use crate::{DecodeScheduler, DeviceContext, Dimensions};
 
 use ash::vk;
 use byteorder::{BigEndian, ReadBytesExt};
 use crate::image::{Frame, ImageView};
+use crate::util::pick_largest_memory_heap;
 
 mod parser;
 mod endian;
@@ -54,41 +52,6 @@ impl UnpackSlicesQuantizationMatrices {
 		target[64..128].copy_from_slice(&self.chroma_quantization_matrix);
 	}
 }
-
-/// Iterator that yields all of the elements in a prefix accumulation.
-struct PrefixAccumulate<I: Iterator, F> {
-	iter: I,
-	acc: Option<I::Item>,
-	map: F,
-}
-impl<I: Iterator, F> Iterator for PrefixAccumulate<I, F>
-	where I::Item: Clone,
-		  F: FnMut(Option<I::Item>, I::Item) -> I::Item {
-
-	type Item = I::Item;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		let next = self.iter.next()?;
-		let result = Some(match self.acc.take() {
-			None => next,
-			Some(prev) => (self.map)(prev, next)
-		});
-
-		self.acc = result.clone();
-		result
-	}
-}
-trait PrefixAccumulateIterExt: Iterator {
-	fn prefix_acc<F>(self, map: F) -> PrefixAccumulate<Self, F>
-		where F: FnMut(Option<Self::Item>, Self::Item) -> Self::Item {
-		PrefixAccumulate {
-			iter: self,
-			acc: None,
-			map,
-		}
-	}
-}
-impl<I: Iterator> PrefixAccumulateIterExt for I {}
 
 pub struct ProRes;
 impl ProRes {
@@ -140,9 +103,9 @@ impl Decoder for ProRes {
 	type Error = Error;
 
 	fn schedule(&self,
-		context: &DeviceContext,
-		shared: &Self::SharedState,
-		instance: &mut Self::InstanceState,
+		_context: &DeviceContext,
+		_shared: &Self::SharedState,
+		_instance: &mut Self::InstanceState,
 		frames: &mut DecodeScheduler<Self>,
 		data: &[u8]
 	) -> Result<usize, Self::Error> {
@@ -202,7 +165,7 @@ impl Decoder for ProRes {
 	fn decode(&self,
 		context: &DeviceContext,
 		shared: &Self::SharedState,
-		instance: &Self::InstanceState,
+		_instance: &Self::InstanceState,
 		worker: &mut Self::WorkerState,
 		frame: &mut Frame<Self::FrameState>,
 		_param: Self::FrameParam,
@@ -691,9 +654,11 @@ struct UploadMemory {
 struct OnDeviceMemory {
 	coefficient_image_extent: vk::Extent2D,
 	coefficient_image: vk::Image,
+	coefficient_image_view: vk::ImageView,
 
 	component_image_extent: vk::Extent2D,
 	component_image: vk::Image,
+	component_image_view: vk::ImageView,
 
 	descriptor_set: vk::DescriptorSet,
 
@@ -1001,55 +966,6 @@ impl WorkerState {
 		Ok(())
 	}
 
-	/// Pick the memory type with the largest heap that fits the given constraints.
-	fn pick_memory(
-		shared: &SharedState,
-		mask: u32,
-		type_requirements: vk::MemoryPropertyFlags,
-		heap_requirements: vk::MemoryHeapFlags,
-	) -> Option<u32> {
-		let mut candidates = 0u32;
-		for i in 0..shared.memory_properties.memory_type_count {
-			let memory_type = shared.memory_properties.memory_types[i as usize];
-			let memory_heap = shared.memory_properties.memory_heaps[memory_type.heap_index as usize];
-
-			let bit = 1u32 << i;
-			if bit & mask == 0 { continue }
-
-			let a = memory_type.property_flags.contains(type_requirements);
-			let b = memory_heap.flags.contains(heap_requirements);
-			if !a || !b { continue }
-
-			candidates |= bit;
-		}
-
-		let mut chosen_type = None;
-		for i in 0..u32::BITS {
-			let is_candidate = (candidates >> i) & 1 != 0;
-			if !is_candidate { continue }
-
-			let memory_type = shared.memory_properties
-				.memory_types[i as usize];
-			let memory_heap = shared.memory_properties
-				.memory_heaps[memory_type.heap_index as usize];
-
-			if let Some(chosen_type) = chosen_type {
-				let chosen_memory_type = shared.memory_properties
-					.memory_types[chosen_type as usize];
-				let chosen_memory_heap = shared.memory_properties
-					.memory_heaps[chosen_memory_type.heap_index as usize];
-
-				if chosen_memory_heap.size >= memory_heap.size {
-					continue
-				}
-			}
-
-			chosen_type = Some(i)
-		}
-
-		chosen_type
-	}
-
 	/// Reports whether the current images are large enough for the given data.
 	pub fn on_device_memory_large_enough(
 		&self,
@@ -1126,8 +1042,8 @@ impl WorkerState {
 			.unwrap_or(true);
 
 		let (allocation, allocation_size) = if requires_new_allocation {
-			let memory_type_index = Self::pick_memory(
-				shared,
+			let memory_type_index = pick_largest_memory_heap(
+				&shared.memory_properties,
 				coefficient_image_memreq.memory_type_bits & component_image_memreq.memory_type_bits,
 				vk::MemoryPropertyFlags::DEVICE_LOCAL,
 				vk::MemoryHeapFlags::DEVICE_LOCAL)
@@ -1147,6 +1063,8 @@ impl WorkerState {
 		};
 
 		if let Some(on_device_memory) = self.on_device_memory.take() {
+			context.device().destroy_image_view(on_device_memory.coefficient_image_view, None);
+			context.device().destroy_image_view(on_device_memory.component_image_view, None);
 			context.device().destroy_image(on_device_memory.coefficient_image, None);
 			context.device().destroy_image(on_device_memory.component_image, None);
 
@@ -1167,11 +1085,66 @@ impl WorkerState {
 			coefficient_image_memreq.size + padding0
 		).unwrap();
 
+		let create_image_view_for = |image| context.device().create_image_view(
+			&vk::ImageViewCreateInfo::builder()
+				.image(coefficient_image)
+				.subresource_range(
+					vk::ImageSubresourceRange::builder()
+						.level_count(1)
+						.layer_count(1)
+						.base_mip_level(0)
+						.base_array_layer(0)
+						.aspect_mask(vk::ImageAspectFlags::COLOR)
+						.build())
+				.format(vk::Format::R32G32B32A32_SFLOAT)
+				.components(
+					vk::ComponentMapping::builder()
+						.r(vk::ComponentSwizzle::R)
+						.g(vk::ComponentSwizzle::G)
+						.b(vk::ComponentSwizzle::B)
+						.a(vk::ComponentSwizzle::A)
+						.build())
+				.view_type(vk::ImageViewType::TYPE_2D)
+				.build(),
+			None);
+
+		let coefficient_image_view = create_image_view_for(coefficient_image)?;
+		let component_image_view = create_image_view_for(component_image)?;
+
+		let descriptor_set = context.device().allocate_descriptor_sets(
+			&vk::DescriptorSetAllocateInfo::builder()
+				.descriptor_pool(self.descriptor_pool)
+				.set_layouts(&[shared.working_data_set_layout])
+				.build())?[0];
+		context.device().update_descriptor_sets(
+			&[
+				vk::WriteDescriptorSet::builder()
+					.dst_set(descriptor_set)
+					.dst_array_element(0)
+					.dst_binding(0)
+					.descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+					.image_info(&[
+						vk::DescriptorImageInfo::builder()
+							.image_layout(vk::ImageLayout::GENERAL)
+							.image_view(coefficient_image_view)
+							.build(),
+						vk::DescriptorImageInfo::builder()
+							.image_layout(vk::ImageLayout::GENERAL)
+							.image_view(component_image_view)
+							.build(),
+					])
+					.build()
+			],
+			&[])?;
+
 		self.on_device_memory = Some(OnDeviceMemory {
 			coefficient_image_extent,
 			coefficient_image,
+			coefficient_image_view,
 			component_image_extent,
 			component_image,
+			component_image_view,
+			descriptor_set,
 			allocation_size,
 			allocation,
 		});
@@ -1261,6 +1234,7 @@ impl WorkerState {
 
 		let map = match self.upload_memory.take() {
 			Some(upload_memory) => {
+				context.device().free_descriptor_sets(self.descriptor_pool, &[upload_memory.descriptor_set])?;
 				context.device().destroy_buffer(upload_memory.index_buffer, None);
 				context.device().destroy_buffer(upload_memory.picture_data_buffer, None);
 
@@ -1284,6 +1258,34 @@ impl WorkerState {
 			index_memreq.size + padding0
 		).unwrap();
 
+		let descriptor_set = context.device().allocate_descriptor_sets(
+			&vk::DescriptorSetAllocateInfo::builder()
+				.descriptor_pool(self.descriptor_pool)
+				.set_layouts(&[shared.input_data_set_layout])
+				.build())?[0];
+		context.device().update_descriptor_sets(
+			&[
+				vk::WriteDescriptorSet::builder()
+					.dst_set(descriptor_set)
+					.dst_array_element(0)
+					.dst_binding(0)
+					.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+					.buffer_info(&[
+						vk::DescriptorBufferInfo::builder()
+							.buffer(index_buffer)
+							.offset(0)
+							.range(index_memreq.size)
+							.build(),
+						vk::DescriptorBufferInfo::builder()
+							.buffer(picture_data_buffer)
+							.offset(0)
+							.range(picture_data_memreq.size)
+							.build(),
+					])
+					.build()
+			],
+			&[])?;
+
 		self.upload_memory = Some(UploadMemory {
 			index_buffer_offset: 0,
 			index_buffer_size: index_memreq.size,
@@ -1291,32 +1293,11 @@ impl WorkerState {
 			picture_data_buffer_offset: index_memreq.size + padding0,
 			picture_data_buffer_size: picture_data_memreq.size,
 			picture_data_buffer,
+			descriptor_set,
 			allocation_size,
 			allocation,
 			map,
 		});
-	}
-
-	/// Recycles an already existing command buffer or creates a new one if none
-	/// are available and returns it.
-	pub unsafe fn get_command_buffer(
-		&mut self,
-		context: &DeviceContext
-	) -> VkResult<vk::CommandBuffer> {
-		let vk = context.device();
-		if let Some(buffer) = self.command_buffer_recycling_queue.pop_front() {
-			vk.reset_command_buffer(
-				buffer,
-				vk::CommandBufferResetFlags::empty())?;
-			Ok(buffer)
-		} else {
-			let buffers = vk.allocate_command_buffers(
-				&vk::CommandBufferAllocateInfo::builder()
-					.command_pool(self.command_pool)
-					.command_buffer_count(1)
-					.build())?;
-			Ok(buffers[0])
-		}
 	}
 }
 
